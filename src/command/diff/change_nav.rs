@@ -7,6 +7,7 @@ use ratatui::layout::Rect;
 pub struct ChangeNavigation {
     pub groups: Vec<Range<usize>>,
     pub selected: Option<usize>,
+    pub single_group_visible: bool,
     pub scroll_targets: Vec<usize>,
     pub area: Rect,
 }
@@ -26,6 +27,7 @@ impl ChangeNavigation {
             scroll_targets,
             groups,
             selected,
+            single_group_visible: false,
             area,
         }
     }
@@ -33,6 +35,9 @@ impl ChangeNavigation {
     pub fn target(&self, forward: bool) -> Option<usize> {
         if self.groups.is_empty() {
             return None;
+        }
+        if self.groups.len() == 1 {
+            return (!self.single_group_visible).then_some(0);
         }
         match (self.selected, forward) {
             (None, true) => Some(0),

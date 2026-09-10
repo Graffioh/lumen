@@ -317,7 +317,9 @@ Mac Option+arrow word-navigation sequences (`Esc+b` / `Esc+f`) are supported too
 Nearby changes are grouped when they fit together on screen, including the lines
 between them. Large changes are split into smaller stops. Groups adapt to the
 terminal size, wrapping, and inline annotations. Arrows stop at the first and last
-group; they do not switch files. Existing `{` / `}` hunk navigation still works.
+group; they do not switch files. With one group already fully visible, both arrows
+are disabled. If you scroll away, they let you return to it. Existing `{` / `}`
+hunk navigation still works.
 
 ### PR annotations with worktree instructions
 

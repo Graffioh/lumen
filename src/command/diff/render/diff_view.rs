@@ -2497,6 +2497,14 @@ pub fn render_diff(
         }
     }
 
+    // A lone group needs navigation only when it is outside the visible area.
+    if let [group] = navigation.groups.as_slice() {
+        let start = scroll as usize;
+        let available = (main_area.height as usize).saturating_sub(2 + content_row_offset);
+        navigation.single_group_visible = group.start >= start
+            && rows[start..group.end].iter().map(|row| row.1).sum::<usize>() <= available;
+    }
+
     render_footer(
         frame,
         footer_area,

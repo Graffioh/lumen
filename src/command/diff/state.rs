@@ -877,9 +877,7 @@ impl AppState {
     }
 
     pub fn navigate_change_group(&mut self, forward: bool) {
-        let Some(index) = self.change_navigation.target(forward)
-            .or(self.change_navigation.selected)
-        else {
+        let Some(index) = self.change_navigation.target(forward) else {
             return;
         };
         let start = self.change_navigation.groups[index].start;
