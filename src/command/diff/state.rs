@@ -889,7 +889,7 @@ impl AppState {
         self.focused_change = Some(start);
         self.change_flash_started = Some(Instant::now());
         self.focused_hunk = self.get_hunks().iter().rposition(|&row| row <= start);
-        self.scroll = start.min(u16::MAX as usize) as u16;
+        self.scroll = self.change_navigation.scroll_targets[index].min(u16::MAX as usize) as u16;
         self.h_scroll = 0;
     }
 

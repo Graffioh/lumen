@@ -311,6 +311,7 @@ The bottom-center arrows (`← 1 / 3 →`) jump between groups of changes in the
 selected file. Click an arrow or press **Alt+Left / Alt+Right**. The active group's
 changed lines have a highlighted gutter marker. Each jump also briefly outlines
 the group in muted yellow, fading away over one second without moving the code.
+Navigation centers the group vertically when space permits, keeping its changes visible.
 Mac Option+arrow word-navigation sequences (`Esc+b` / `Esc+f`) are supported too.
 
 Nearby changes are grouped when they fit together on screen, including the lines

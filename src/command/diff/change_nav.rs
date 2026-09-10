@@ -7,6 +7,7 @@ use ratatui::layout::Rect;
 pub struct ChangeNavigation {
     pub groups: Vec<Range<usize>>,
     pub selected: Option<usize>,
+    pub scroll_targets: Vec<usize>,
     pub area: Rect,
 }
 
@@ -20,7 +21,9 @@ impl ChangeNavigation {
         } else {
             Rect::default()
         };
+        let scroll_targets = groups.iter().map(|group| group.start).collect();
         Self {
+            scroll_targets,
             groups,
             selected,
             area,
@@ -51,6 +54,23 @@ impl ChangeNavigation {
         }
         None
     }
+}
+
+/// Place the group near the viewport center using rendered row heights, so
+/// wrapped context and annotation overlays cannot push the changes off screen.
+pub fn centered_scroll(rows: &[(bool, usize)], group: &Range<usize>, viewport: usize) -> usize {
+    let height: usize = rows[group.clone()].iter().map(|row| row.1.max(1)).sum();
+    let mut space_above = viewport.saturating_sub(height) / 2;
+    let mut start = group.start;
+    while start > 0 {
+        let previous_height = rows[start - 1].1.max(1);
+        if previous_height > space_above {
+            break;
+        }
+        space_above -= previous_height;
+        start -= 1;
+    }
+    start
 }
 
 /// macOS terminals can send Option+arrows as the readline word motions Esc+b/f.
@@ -245,6 +265,22 @@ mod tests {
         assert_ne!(terminal.backend().buffer()[(0, 5)].fg, bright);
         render(&mut terminal, 0.0);
         assert_eq!(terminal.backend().buffer()[(0, 5)].symbol(), " ");
+    }
+
+    #[test]
+    fn centers_groups_and_clamps_at_start_of_file() {
+        let rows = vec![(false, 1); 100];
+        assert_eq!(centered_scroll(&rows, &(40..50), 30), 30);
+        assert_eq!(centered_scroll(&rows, &(3..5), 30), 0);
+        assert_eq!(centered_scroll(&rows, &(40..70), 30), 40);
+        assert_eq!(centered_scroll(&rows, &(40..80), 30), 40);
+    }
+
+    #[test]
+    fn centering_accounts_for_wrapped_context_and_overlays() {
+        let rows = [(false, 1), (false, 8), (false, 3), (true, 2), (true, 2)];
+        assert_eq!(centered_scroll(&rows, &(3..5), 12), 2);
+        assert_eq!(centered_scroll(&rows, &(3..5), 8), 3);
     }
 
     #[test]

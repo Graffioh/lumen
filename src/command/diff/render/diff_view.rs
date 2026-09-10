@@ -1477,7 +1477,10 @@ pub fn render_diff(
     let budget = (main_area.height as usize)
         .saturating_sub(4 + context_reserve + file_slots_height(&file_slots));
     let anchor = focused_change.or_else(|| focused_hunk.and_then(|i| hunks.get(i).copied()));
-    let navigation = ChangeNavigation::new(group_changes(&rows, budget), anchor, footer_area);
+    let mut navigation = ChangeNavigation::new(group_changes(&rows, budget), anchor, footer_area);
+    navigation.scroll_targets = navigation.groups.iter().map(|group| {
+        crate::command::diff::change_nav::centered_scroll(&rows, group, budget.saturating_add(2))
+    }).collect();
     let focused_range = navigation.selected.map(|i| &navigation.groups[i]);
 
     // Track how many non-diff rows are at the top (context lines + file annotations)
