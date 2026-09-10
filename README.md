@@ -305,6 +305,17 @@ The host must give Lumen an interactive terminal; Codex CLI 0.154.0 detaches `!`
 shell commands from the terminal, so open Lumen in a normal terminal pane and use
 `!cat` in Codex afterward.
 
+### Navigate changes in large files
+
+The bottom-center arrows (`← 1 / 3 →`) jump between groups of changes in the
+selected file. Click an arrow or press **Alt+Left / Alt+Right**. The active group's
+changed lines have a highlighted gutter marker.
+
+Nearby changes are grouped when they fit together on screen, including the lines
+between them. Large changes are split into smaller stops. Groups adapt to the
+terminal size, wrapping, and inline annotations. Arrows stop at the first and last
+group; they do not switch files. Existing `{` / `}` hunk navigation still works.
+
 ### PR annotations with worktree instructions
 
 ```sh

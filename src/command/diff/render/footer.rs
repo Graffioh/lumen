@@ -4,6 +4,7 @@ use ratatui::{prelude::*, widgets::Paragraph};
 
 use crate::command::diff::search::{SearchMode, SearchState};
 use crate::command::diff::theme;
+use crate::command::diff::change_nav::ChangeNavigation;
 use crate::command::diff::PrInfo;
 
 pub struct FooterData<'a> {
@@ -17,6 +18,7 @@ pub struct FooterData<'a> {
     pub line_stats_removed: usize,
     pub hunk_count: usize,
     pub focused_hunk: Option<usize>,
+    pub navigation: Option<&'a ChangeNavigation>,
     pub search_state: &'a SearchState,
     pub area_width: u16,
 }
@@ -268,6 +270,62 @@ pub fn render_footer(frame: &mut Frame, footer_area: Rect, data: FooterData) {
 
         let left_line = Line::from(left_spans);
         let right_line = Line::from(right_spans);
+
+        if let Some(nav) = data
+            .navigation
+            .filter(|n| n.area.width > 0 && !n.groups.is_empty())
+        {
+            let left = Rect::new(
+                footer_area.x,
+                footer_area.y,
+                nav.area.x.saturating_sub(footer_area.x),
+                1,
+            );
+            let right = Rect::new(
+                nav.area.right(),
+                footer_area.y,
+                footer_area.right().saturating_sub(nav.area.right()),
+                1,
+            );
+            frame.render_widget(
+                Paragraph::new(left_line).style(Style::default().bg(bg)),
+                left,
+            );
+            frame.render_widget(
+                Paragraph::new(right_line)
+                    .alignment(Alignment::Right)
+                    .style(Style::default().bg(bg)),
+                right,
+            );
+            let arrow_style = |forward| {
+                Style::default()
+                    .bg(t.ui.footer_branch_bg)
+                    .fg(if nav.target(forward).is_some() {
+                        t.ui.highlight
+                    } else {
+                        t.ui.text_muted
+                    })
+            };
+            let label = format!(
+                " {} / {} ",
+                nav.selected.map_or(0, |i| i + 1),
+                nav.groups.len()
+            );
+            frame.render_widget(
+                Paragraph::new(Line::from(vec![
+                    Span::styled(" ← ", arrow_style(false)),
+                    Span::styled(
+                        label,
+                        Style::default()
+                            .fg(t.ui.text_primary)
+                            .bg(t.ui.footer_branch_bg),
+                    ),
+                    Span::styled(" → ", arrow_style(true)),
+                ])),
+                nav.area,
+            );
+            return;
+        }
 
         let footer_width = footer_area.width as usize;
         let left_len = left_line.width();

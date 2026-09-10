@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use crate::command::diff::change_nav::{group_changes, ChangeNavigation};
 
 use ratatui::{
     prelude::*,
@@ -1270,6 +1271,7 @@ pub fn render_diff(
     commit_ref: &str,
     pr_info: Option<&PrInfo>,
     focused_hunk: Option<usize>,
+    focused_change: Option<usize>,
     hunks: &[usize],
     stacked_mode: bool,
     stacked_commit: Option<&StackedCommitInfo>,
@@ -1285,7 +1287,7 @@ pub fn render_diff(
     total_added: usize,
     total_removed: usize,
     editor: Option<&AnnotationEditor>,
-) -> (usize, Vec<(usize, usize)>, Vec<(u64, Rect)>, Option<Rect>) {
+) -> (usize, Vec<(usize, usize)>, Vec<(u64, Rect)>, Option<Rect>, ChangeNavigation) {
     let area = frame.area();
     let t = theme::get();
     let bg = t.ui.bg;
@@ -1387,11 +1389,12 @@ pub fn render_diff(
                 line_stats_removed: 0,
                 hunk_count: 0,
                 focused_hunk: None,
+                navigation: None,
                 search_state,
                 area_width: area.width,
             },
         );
-        return (0, Vec::new(), Vec::new(), None);
+        return (0, Vec::new(), Vec::new(), None, ChangeNavigation::default());
     }
 
     // side_by_side is now passed as a parameter (pre-computed and cached)
@@ -1399,6 +1402,82 @@ pub fn render_diff(
 
     let is_new_file = diff.old_content.is_empty() && !diff.new_content.is_empty();
     let is_deleted_file = !diff.old_content.is_empty() && diff.new_content.is_empty();
+
+    // Measure wrapping with the same routine used to paint each line. Reserve
+    // sticky-context rows and annotation slots so nearby changes fit together.
+    let single_panel = is_new_file || is_deleted_file || diff_fullscreen != DiffFullscreen::None;
+    let panel_width = if single_panel {
+        main_area.width
+    } else {
+        main_area.width / 2
+    };
+    let target_width = panel_width.saturating_sub(2) as usize;
+    let file_annotations: Vec<_> = annotations
+        .iter()
+        .filter(|a| a.filename == diff.filename && matches!(a.target, AnnotationTarget::File))
+        .collect();
+    let line_annotations: Vec<_> = annotations
+        .iter()
+        .filter(|a| {
+            a.filename == diff.filename && matches!(a.target, AnnotationTarget::LineRange { .. })
+        })
+        .collect();
+    let file_slots = build_file_slots(&file_annotations, editor, &diff.filename);
+    let line_slots = build_line_slots(&line_annotations, editor, &diff.filename);
+    let rows: Vec<_> = side_by_side
+        .iter()
+        .map(|line| {
+            let height = [&line.old_line, &line.new_line]
+                .into_iter()
+                .flatten()
+                .map(|(num, text)| {
+                    if !settings.wrap {
+                        return 1;
+                    }
+                    wrapped_diff_lines(
+                        vec![Span::raw(format!(" {:4} ", num))],
+                        vec![Span::raw(crate::command::diff::types::expand_tabs(
+                            text,
+                            settings.tab_width,
+                        ))],
+                        target_width,
+                        bg,
+                        true,
+                    )
+                    .len()
+                })
+                .max()
+                .unwrap_or(1);
+            let overlays: usize = line_slots
+                .iter()
+                .filter(|slot| {
+                    if let AnnotationTarget::LineRange {
+                        panel, end_line, ..
+                    } = slot.target()
+                    {
+                        line.line_number(*panel) == Some(*end_line)
+                    } else {
+                        false
+                    }
+                })
+                .map(|slot| slot.height())
+                .sum();
+            (
+                !matches!(line.change_type, ChangeType::Equal),
+                height + overlays,
+            )
+        })
+        .collect();
+    let context_reserve = if settings.context.enabled {
+        settings.context.max_lines
+    } else {
+        0
+    };
+    let budget = (main_area.height as usize)
+        .saturating_sub(4 + context_reserve + file_slots_height(&file_slots));
+    let anchor = focused_change.or_else(|| focused_hunk.and_then(|i| hunks.get(i).copied()));
+    let navigation = ChangeNavigation::new(group_changes(&rows, budget), anchor, footer_area);
+    let focused_range = navigation.selected.map(|i| &navigation.groups[i]);
 
     // Track how many non-diff rows are at the top (context lines + file annotations)
     let content_row_offset: usize;
@@ -1506,7 +1585,7 @@ pub fn render_diff(
             if let Some((num, text)) = &diff_line.new_line {
                 let mut spans: Vec<Span> = Vec::new();
                 spans.push(make_indicator_span(
-                    false,
+                    focused_range.is_some_and(|range| range.contains(&line_idx)),
                     in_annotation,
                     new_line_selected,
                     bg,
@@ -1682,7 +1761,7 @@ pub fn render_diff(
             if let Some((num, text)) = &diff_line.old_line {
                 let mut spans: Vec<Span> = Vec::new();
                 spans.push(make_indicator_span(
-                    false,
+                    focused_range.is_some_and(|range| range.contains(&line_idx)),
                     in_annotation,
                     old_line_selected,
                     bg,
@@ -1873,6 +1952,9 @@ pub fn render_diff(
         let is_in_focused_hunk = |line_idx: usize, change_type: ChangeType| -> bool {
             if matches!(change_type, ChangeType::Equal) {
                 return false;
+            }
+            if let Some(range) = focused_range {
+                return range.contains(&line_idx);
             }
             if let Some(hunk_idx) = focused_hunk {
                 if let Some(&hunk_start) = hunks.get(hunk_idx) {
@@ -2390,11 +2472,12 @@ pub fn render_diff(
             line_stats_removed: line_stats.removed,
             hunk_count,
             focused_hunk,
+            navigation: Some(&navigation),
             search_state,
             area_width: area.width,
         },
     );
 
-    (content_row_offset, overlay_gaps, annotation_rects, editor_rect)
+    (content_row_offset, overlay_gaps, annotation_rects, editor_rect, navigation)
 }
 

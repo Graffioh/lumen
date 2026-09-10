@@ -172,6 +172,8 @@ pub struct AppState {
     pub needs_reload: bool,
     pub watching: bool,
     pub focused_hunk: Option<usize>,
+    pub focused_change: Option<usize>,
+    pub change_navigation: super::change_nav::ChangeNavigation,
     // Annotation fields
     pub annotations: Vec<Annotation>,
     annotation_next_id: u64,
@@ -308,6 +310,8 @@ impl AppState {
             needs_reload: false,
             watching: false,
             focused_hunk,
+            focused_change: None,
+            change_navigation: Default::default(),
             annotations: Vec::new(),
             annotation_next_id: 0,
             stacked_mode: false,
@@ -520,6 +524,8 @@ impl AppState {
 
     /// Invalidate the cache (call when file changes)
     pub fn invalidate_cache(&mut self) {
+        self.focused_change = None;
+        self.change_navigation = Default::default();
         self.cached_side_by_side = None;
         self.cached_hunks = None;
         self.cached_total_lines = None;
@@ -865,6 +871,20 @@ impl AppState {
             .unwrap_or(0);
         self.h_scroll = 0;
         self.focused_hunk = if hunks.is_empty() { None } else { Some(0) };
+    }
+
+    pub fn navigate_change_group(&mut self, forward: bool) {
+        let Some(index) = self.change_navigation.target(forward) else {
+            return;
+        };
+        let start = self.change_navigation.groups[index].start;
+        self.change_navigation.selected = Some(index);
+        self.clear_selection();
+        self.focused_panel = FocusedPanel::DiffView;
+        self.focused_change = Some(start);
+        self.focused_hunk = self.get_hunks().iter().rposition(|&row| row <= start);
+        self.scroll = start.min(u16::MAX as usize) as u16;
+        self.h_scroll = 0;
     }
 
     /// Get annotation by id

@@ -1,5 +1,6 @@
 mod annotation;
 mod app;
+mod change_nav;
 mod context;
 mod coordinates;
 mod diff_algo;

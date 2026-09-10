@@ -441,12 +441,13 @@ fn run_app_internal(
                 .unwrap_or(&empty_viewed_hunks);
             let branch_fallback = get_current_branch(backend);
             let commit_ref = state.diff_reference.as_deref().unwrap_or(&branch_fallback);
+            let navigation_cell = std::cell::RefCell::new(Default::default());
             let row_offset = std::cell::Cell::new(0usize);
             let gaps_cell = std::cell::RefCell::new(Vec::new());
             let rects_cell = std::cell::RefCell::new(Vec::new());
             let editor_rect_cell: std::cell::Cell<Option<ratatui::layout::Rect>> = std::cell::Cell::new(None);
             terminal.draw(|frame| {
-                let (offset, gaps, rects, er) = render_diff(
+                let (offset, gaps, rects, er, navigation) = render_diff(
                     frame,
                     diff,
                     &state.file_diffs,
@@ -475,6 +476,7 @@ fn run_app_internal(
                     commit_ref,
                     pr_info.as_ref(),
                     state.focused_hunk,
+                    state.focused_change,
                     &hunks,
                     state.stacked_mode,
                     state.current_commit(),
@@ -491,6 +493,7 @@ fn run_app_internal(
                     state.total_removed,
                     annotation_editor.as_ref(),
                 );
+                *navigation_cell.borrow_mut() = navigation;
                 row_offset.set(offset);
                 *rects_cell.borrow_mut() = rects;
                 editor_rect_cell.set(er);
@@ -581,6 +584,7 @@ fn run_app_internal(
                     modal.render(frame);
                 }
             })?;
+            state.change_navigation = navigation_cell.into_inner();
             state.content_row_offset = row_offset.get();
             state.annotation_overlay_gaps = gaps_cell.into_inner();
             state.annotation_rects = rects_cell.into_inner();
@@ -938,6 +942,14 @@ fn run_app_internal(
                                     annotation_editor = None;
                                 }
                                 continue;
+                            }
+                            if !state.search_state.is_active() {
+                                if let Some(forward) =
+                                    state.change_navigation.hit(mouse.column, mouse.row)
+                                {
+                                    state.navigate_change_group(forward);
+                                    continue;
+                                }
                             }
                             // Click on an existing annotation overlay → open inline editor for it.
                             let hit_annotation =
@@ -1489,6 +1501,11 @@ fn run_app_internal(
                                 }
                             }
                         }
+                        KeyCode::Left | KeyCode::Right
+                            if key.modifiers.contains(KeyModifiers::ALT) =>
+                        {
+                            state.navigate_change_group(key.code == KeyCode::Right);
+                        }
                         KeyCode::Char('h') | KeyCode::Left => {
                             if state.focused_panel == FocusedPanel::DiffView && !state.settings.wrap
                             {
@@ -1703,6 +1720,7 @@ fn run_app_internal(
                                     (current_hunk + 1).min(hunks.len().saturating_sub(1))
                                 };
                                 if !hunks.is_empty() {
+                                    state.focused_change = None;
                                     state.focused_hunk = Some(next_hunk);
                                     state.scroll = adjust_scroll_for_hunk(
                                         hunks[next_hunk],
@@ -1727,6 +1745,7 @@ fn run_app_internal(
                                     current_hunk.saturating_sub(1)
                                 };
                                 if !hunks.is_empty() {
+                                    state.focused_change = None;
                                     state.focused_hunk = Some(prev_hunk);
                                     state.scroll = adjust_scroll_for_hunk(
                                         hunks[prev_hunk],
@@ -2209,6 +2228,10 @@ fn run_app_internal(
                                             KeyBind {
                                                 key: "I",
                                                 description: "View all annotations",
+                                            },
+                                            KeyBind {
+                                                key: "Alt+← / Alt+→",
+                                                description: "Previous / next screen-sized change group",
                                             },
                                             KeyBind {
                                                 key: "s",
