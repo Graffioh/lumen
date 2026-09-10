@@ -2,7 +2,7 @@ use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
 use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use crossterm::{
     event::{
@@ -34,6 +34,43 @@ fn open_tui_writer() -> io::Result<Box<dyn Write + Send>> {
         }
     }
     Ok(Box::new(io::stdout()))
+}
+
+/// Present complete frames to remote terminals even if the PTY splits a write.
+fn draw_synchronized<W: Write>(
+    terminal: &mut Terminal<CrosstermBackend<W>>,
+    render: impl FnOnce(&mut Frame),
+) -> io::Result<()> {
+    crossterm::queue!(
+        terminal.backend_mut(),
+        crossterm::terminal::BeginSynchronizedUpdate
+    )?;
+    let result = terminal.draw(render).map(|_| ());
+    let end_result = execute!(
+        terminal.backend_mut(),
+        crossterm::terminal::EndSynchronizedUpdate
+    );
+    result.and(end_result)
+}
+
+/// Only scrolling keys can share a frame. Other commands may need the updated
+/// geometry (for example, clicking or annotating the newly visible lines).
+fn is_scroll_key(event: &Event) -> bool {
+    let Event::Key(key) = event else { return false };
+    key.kind != KeyEventKind::Release
+        && ((key.modifiers.is_empty()
+            && matches!(
+                key.code,
+                KeyCode::Up
+                    | KeyCode::Down
+                    | KeyCode::Left
+                    | KeyCode::Right
+                    | KeyCode::PageUp
+                    | KeyCode::PageDown
+                    | KeyCode::Char('h' | 'j' | 'k' | 'l')
+            ))
+            || (key.modifiers == KeyModifiers::CONTROL
+                && matches!(key.code, KeyCode::Char('u' | 'd'))))
 }
 
 use super::annotation::{AnnotationEditor, AnnotationEditorResult};
@@ -380,6 +417,7 @@ fn run_app_internal(
     let mut pending_watch_event: Option<WatchEvent> = None;
     let mut pending_events: VecDeque<Event> = VecDeque::new();
     let mut saved_annotations = None;
+    let mut needs_redraw = true;
 
     'main: loop {
         if let Some(ref rx) = watch_rx {
@@ -394,6 +432,7 @@ fn run_app_internal(
         }
 
         if state.needs_reload {
+            needs_redraw = true;
             let file_diffs = if let Some(ref pr) = pr_info {
                 // In PR mode, reload from GitHub
                 match load_pr_file_diffs(pr) {
@@ -417,187 +456,196 @@ fn run_app_internal(
             }
         }
 
-        if state.file_diffs.is_empty() {
-            terminal.draw(|frame| {
-                render_empty_state(frame, state.watching);
-                if let Some(ref modal) = active_modal {
-                    modal.render(frame);
-                }
-            })?;
-        } else {
-            // Use cached side_by_side (avoids recomputing diff every frame during drag etc.)
-            state.update_search_matches();
-            // Ensure highlighters are cached (only recomputed when file changes)
-            state.get_highlighters();
-            let diff = &state.file_diffs[state.current_file];
-            let side_by_side = state.side_by_side_ref();
-            let hunks = state.hunks_ref();
-            let (old_hl, new_hl) = state.highlighters_ref().unwrap();
-            let hunk_count = hunks.len();
-            let empty_viewed_hunks: std::collections::HashSet<usize> =
-                std::collections::HashSet::new();
-            let viewed_hunks_for_file = state
-                .viewed_hunks
-                .get(&diff.filename)
-                .unwrap_or(&empty_viewed_hunks);
-            let branch_fallback = if state.diff_reference.is_none() {
-                get_current_branch(backend)
+        if needs_redraw || state.change_flash_started.is_some() {
+            if state.change_flash_started
+                .is_some_and(|start| start.elapsed() >= Duration::from_secs(1))
+            {
+                // Render once without the border, then stop the animation timer.
+                state.change_flash_started = None;
+            }
+            if state.file_diffs.is_empty() {
+                draw_synchronized(&mut terminal, |frame| {
+                    render_empty_state(frame, state.watching);
+                    if let Some(ref modal) = active_modal {
+                        modal.render(frame);
+                    }
+                })?;
             } else {
-                String::new()
-            };
-            let commit_ref = state.diff_reference.as_deref().unwrap_or(&branch_fallback);
-            let navigation_cell = std::cell::RefCell::new(Default::default());
-            let row_offset = std::cell::Cell::new(0usize);
-            let gaps_cell = std::cell::RefCell::new(Vec::new());
-            let rects_cell = std::cell::RefCell::new(Vec::new());
-            let editor_rect_cell: std::cell::Cell<Option<ratatui::layout::Rect>> = std::cell::Cell::new(None);
-            terminal.draw(|frame| {
-                let (offset, gaps, rects, er, navigation) = render_diff(
-                    frame,
-                    diff,
-                    &state.file_diffs,
-                    &state.cached_trees,
-                    &state.sidebar_items,
-                    &state.sidebar_visible,
-                    &state.collapsed_dirs,
-                    state.current_file,
-                    state.scroll,
-                    if state.settings.wrap {
-                        0
-                    } else {
-                        state.h_scroll
-                    },
-                    state.watching,
-                    state.show_sidebar,
-                    state.focused_panel,
-                    state.sidebar_selected,
-                    state.sidebar_scroll,
-                    state.sidebar_h_scroll,
-                    &state.viewed_files,
-                    &state.settings,
-                    hunk_count,
-                    state.diff_fullscreen,
-                    &state.search_state,
-                    commit_ref,
-                    pr_info.as_ref(),
-                    state.focused_hunk,
-                    state.focused_change,
-                    state.change_flash_started
-                        .map(|start| super::change_nav::flash_strength(start.elapsed()))
-                        .unwrap_or(0.0),
-                    &hunks,
-                    state.stacked_mode,
-                    state.current_commit(),
-                    state.current_commit_index,
-                    state.stacked_commits.len(),
-                    &side_by_side,
-                    state.vcs_name,
-                    &state.annotations,
-                    &state.selection,
-                    old_hl,
-                    new_hl,
-                    viewed_hunks_for_file,
-                    state.total_added,
-                    state.total_removed,
-                    annotation_editor.as_ref(),
-                    &state.navigation_layout,
-                );
-                *navigation_cell.borrow_mut() = navigation;
-                row_offset.set(offset);
-                *rects_cell.borrow_mut() = rects;
-                editor_rect_cell.set(er);
-
-                // Selection action tooltip (shown after drag completes)
-                if state.show_selection_tooltip
-                    && state.selection.is_active()
-                    && !state.is_dragging
-                    && annotation_editor.is_none()
-                    && active_modal.is_none()
-                {
-                    let t = theme::get();
-                    let term = frame.area();
-                    let header_h: u16 = if state.stacked_mode { 1 } else { 0 };
-                    let sidebar_w: u16 = if state.show_sidebar {
-                        (term.width / 4).clamp(20, 35)
-                    } else {
-                        0
-                    };
-                    let layout = PanelLayout::calculate(
-                        term.width,
-                        sidebar_w,
+                // Use cached side_by_side (avoids recomputing diff every frame during drag etc.)
+                state.update_search_matches();
+                // Ensure highlighters are cached (only recomputed when file changes)
+                state.get_highlighters();
+                let diff = &state.file_diffs[state.current_file];
+                let side_by_side = state.side_by_side_ref();
+                let hunks = state.hunks_ref();
+                let (old_hl, new_hl) = state.highlighters_ref().unwrap();
+                let hunk_count = hunks.len();
+                let empty_viewed_hunks: std::collections::HashSet<usize> =
+                    std::collections::HashSet::new();
+                let viewed_hunks_for_file = state
+                    .viewed_hunks
+                    .get(&diff.filename)
+                    .unwrap_or(&empty_viewed_hunks);
+                let branch_fallback = if state.diff_reference.is_none() {
+                    get_current_branch(backend)
+                } else {
+                    String::new()
+                };
+                let commit_ref = state.diff_reference.as_deref().unwrap_or(&branch_fallback);
+                let navigation_cell = std::cell::RefCell::new(Default::default());
+                let row_offset = std::cell::Cell::new(0usize);
+                let gaps_cell = std::cell::RefCell::new(Vec::new());
+                let rects_cell = std::cell::RefCell::new(Vec::new());
+                let editor_rect_cell: std::cell::Cell<Option<ratatui::layout::Rect>> = std::cell::Cell::new(None);
+                draw_synchronized(&mut terminal, |frame| {
+                    let (offset, gaps, rects, er, navigation) = render_diff(
+                        frame,
+                        diff,
+                        &state.file_diffs,
+                        &state.cached_trees,
+                        &state.sidebar_items,
+                        &state.sidebar_visible,
+                        &state.collapsed_dirs,
+                        state.current_file,
+                        state.scroll,
+                        if state.settings.wrap {
+                            0
+                        } else {
+                            state.h_scroll
+                        },
+                        state.watching,
                         state.show_sidebar,
+                        state.focused_panel,
+                        state.sidebar_selected,
+                        state.sidebar_scroll,
+                        state.sidebar_h_scroll,
+                        &state.viewed_files,
+                        &state.settings,
+                        hunk_count,
                         state.diff_fullscreen,
+                        &state.search_state,
+                        commit_ref,
+                        pr_info.as_ref(),
+                        state.focused_hunk,
+                        state.focused_change,
+                        state.change_flash_started
+                            .map(|start| super::change_nav::flash_strength(start.elapsed()))
+                            .unwrap_or(0.0),
+                        &hunks,
+                        state.stacked_mode,
+                        state.current_commit(),
+                        state.current_commit_index,
+                        state.stacked_commits.len(),
+                        &side_by_side,
+                        state.vcs_name,
+                        &state.annotations,
+                        &state.selection,
+                        old_hl,
+                        new_hl,
+                        viewed_hunks_for_file,
+                        state.total_added,
+                        state.total_removed,
+                        annotation_editor.as_ref(),
+                        &state.navigation_layout,
                     );
+                    *navigation_cell.borrow_mut() = navigation;
+                    row_offset.set(offset);
+                    *rects_cell.borrow_mut() = rects;
+                    editor_rect_cell.set(er);
 
-                    let sel = &state.selection;
-                    let (_, sel_end) = sel.normalized_range();
-                    let scroll_usize = state.scroll as usize;
+                    // Selection action tooltip (shown after drag completes)
+                    if state.show_selection_tooltip
+                        && state.selection.is_active()
+                        && !state.is_dragging
+                        && annotation_editor.is_none()
+                        && active_modal.is_none()
+                    {
+                        let t = theme::get();
+                        let term = frame.area();
+                        let header_h: u16 = if state.stacked_mode { 1 } else { 0 };
+                        let sidebar_w: u16 = if state.show_sidebar {
+                            (term.width / 4).clamp(20, 35)
+                        } else {
+                            0
+                        };
+                        let layout = PanelLayout::calculate(
+                            term.width,
+                            sidebar_w,
+                            state.show_sidebar,
+                            state.diff_fullscreen,
+                        );
 
-                    if sel_end.line >= scroll_usize {
-                        let content_y = sel_end.line - scroll_usize;
+                        let sel = &state.selection;
+                        let (_, sel_end) = sel.normalized_range();
+                        let scroll_usize = state.scroll as usize;
 
-                        // Account for annotation overlay gaps
-                        let mut cum_gaps: u16 = 0;
-                        for &(after_line, gap_h) in &gaps {
-                            if after_line < content_y {
-                                cum_gaps += gap_h as u16;
+                        if sel_end.line >= scroll_usize {
+                            let content_y = sel_end.line - scroll_usize;
+
+                            // Account for annotation overlay gaps
+                            let mut cum_gaps: u16 = 0;
+                            for &(after_line, gap_h) in &gaps {
+                                if after_line < content_y {
+                                    cum_gaps += gap_h as u16;
+                                }
+                            }
+
+                            // Position below the selection end
+                            let screen_y =
+                                header_h + 1 + offset as u16 + content_y as u16 + cum_gaps + 1;
+
+                            let (panel_x, panel_w) = match sel.panel {
+                                DiffPanelFocus::Old => (layout.old_panel_x, layout.old_panel_width),
+                                DiffPanelFocus::New => (layout.new_panel_x, layout.new_panel_width),
+                                _ => (0, 0),
+                            };
+
+                            if panel_w > 0 && screen_y < term.height.saturating_sub(1) {
+                                let tip_w: u16 = 27;
+                                let tip_h: u16 = 1;
+
+                                let cx = layout.content_x_offset(sel.panel);
+                                let tip_x =
+                                    (panel_x + cx).min(panel_x + panel_w.saturating_sub(tip_w + 1));
+
+                                let tip_area = Rect::new(tip_x, screen_y, tip_w.min(panel_w), tip_h);
+
+                                let bg = t.ui.footer_branch_bg;
+                                let key_style = Style::default().fg(t.ui.text_primary).bg(bg).bold();
+                                let desc_style = Style::default().fg(t.ui.text_muted).bg(bg);
+                                let tip_line = Line::from(vec![
+                                    Span::styled(" i", key_style),
+                                    Span::styled(" annotate ", desc_style),
+                                    Span::styled("y", key_style),
+                                    Span::styled(" copy ", desc_style),
+                                    Span::styled("esc", key_style),
+                                    Span::styled("   ", desc_style),
+                                ]);
+
+                                frame.render_widget(ratatui::widgets::Clear, tip_area);
+                                frame.render_widget(
+                                    ratatui::widgets::Paragraph::new(tip_line)
+                                        .style(Style::default().bg(bg)),
+                                    tip_area,
+                                );
                             }
                         }
-
-                        // Position below the selection end
-                        let screen_y =
-                            header_h + 1 + offset as u16 + content_y as u16 + cum_gaps + 1;
-
-                        let (panel_x, panel_w) = match sel.panel {
-                            DiffPanelFocus::Old => (layout.old_panel_x, layout.old_panel_width),
-                            DiffPanelFocus::New => (layout.new_panel_x, layout.new_panel_width),
-                            _ => (0, 0),
-                        };
-
-                        if panel_w > 0 && screen_y < term.height.saturating_sub(1) {
-                            let tip_w: u16 = 27;
-                            let tip_h: u16 = 1;
-
-                            let cx = layout.content_x_offset(sel.panel);
-                            let tip_x =
-                                (panel_x + cx).min(panel_x + panel_w.saturating_sub(tip_w + 1));
-
-                            let tip_area = Rect::new(tip_x, screen_y, tip_w.min(panel_w), tip_h);
-
-                            let bg = t.ui.footer_branch_bg;
-                            let key_style = Style::default().fg(t.ui.text_primary).bg(bg).bold();
-                            let desc_style = Style::default().fg(t.ui.text_muted).bg(bg);
-                            let tip_line = Line::from(vec![
-                                Span::styled(" i", key_style),
-                                Span::styled(" annotate ", desc_style),
-                                Span::styled("y", key_style),
-                                Span::styled(" copy ", desc_style),
-                                Span::styled("esc", key_style),
-                                Span::styled("   ", desc_style),
-                            ]);
-
-                            frame.render_widget(ratatui::widgets::Clear, tip_area);
-                            frame.render_widget(
-                                ratatui::widgets::Paragraph::new(tip_line)
-                                    .style(Style::default().bg(bg)),
-                                tip_area,
-                            );
-                        }
                     }
-                }
 
-                *gaps_cell.borrow_mut() = gaps;
-                // Editor is rendered inline by render_diff above; only the modal
-                // (annotations list, file picker, etc.) sits on top of everything.
-                if let Some(ref modal) = active_modal {
-                    modal.render(frame);
-                }
-            })?;
-            state.change_navigation = navigation_cell.into_inner();
-            state.content_row_offset = row_offset.get();
-            state.annotation_overlay_gaps = gaps_cell.into_inner();
-            state.annotation_rects = rects_cell.into_inner();
-            state.editor_rect = editor_rect_cell.get();
+                    *gaps_cell.borrow_mut() = gaps;
+                    // Editor is rendered inline by render_diff above; only the modal
+                    // (annotations list, file picker, etc.) sits on top of everything.
+                    if let Some(ref modal) = active_modal {
+                        modal.render(frame);
+                    }
+                })?;
+                state.change_navigation = navigation_cell.into_inner();
+                state.content_row_offset = row_offset.get();
+                state.annotation_overlay_gaps = gaps_cell.into_inner();
+                state.annotation_rects = rects_cell.into_inner();
+                state.editor_rect = editor_rect_cell.get();
+            }
+            needs_redraw = false;
         }
 
         // Poll for new events if no pending events
@@ -612,8 +660,24 @@ fn run_app_internal(
             pending_events.push_back(event::read()?);
         }
 
-        // Process all pending events
-        while let Some(current_event) = pending_events.pop_front() {
+        // Drain ready scrolling keys before drawing. Never wait to form a batch,
+        // and bound the work so a sustained input stream cannot starve rendering.
+        let batch_started = Instant::now();
+        let mut batch_count = 0;
+        while let Some(mut current_event) = pending_events.pop_front() {
+            needs_redraw = true;
+            let batch_scroll = active_modal.is_none()
+                && annotation_editor.is_none()
+                && !state.search_state.is_active()
+                && state.focused_panel == FocusedPanel::DiffView
+                && is_scroll_key(&current_event);
+            if batch_scroll {
+                if let Event::Key(ref mut key) = current_event {
+                    // Enhanced keyboard protocols can report held keys as Repeat.
+                    key.kind = KeyEventKind::Press;
+                }
+            }
+            batch_count += 1;
             let visible_height = terminal.size()?.height.saturating_sub(2) as usize;
             let bottom_padding = 5;
             let max_scroll = if !state.file_diffs.is_empty() {
@@ -2264,6 +2328,20 @@ fn run_app_internal(
                     }
                 }
                 _ => {}
+            }
+            if batch_scroll
+                && pending_events.is_empty()
+                && batch_count < 64
+                && batch_started.elapsed() < Duration::from_millis(4)
+                && event::poll(Duration::ZERO)?
+            {
+                let next_event = event::read()?;
+                let can_batch = is_scroll_key(&next_event);
+                pending_events.push_back(next_event);
+                if !can_batch {
+                    // Refresh geometry before handling the next command.
+                    break;
+                }
             }
         }
     }
