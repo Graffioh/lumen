@@ -73,6 +73,13 @@ fn is_scroll_key(event: &Event) -> bool {
                 && matches!(key.code, KeyCode::Char('u' | 'd'))))
 }
 
+fn is_scroll_event(event: &Event) -> bool {
+    is_scroll_key(event)
+        || matches!(event, Event::Mouse(mouse) if matches!(mouse.kind,
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown
+                | MouseEventKind::ScrollLeft | MouseEventKind::ScrollRight))
+}
+
 use super::annotation::{AnnotationEditor, AnnotationEditorResult};
 use super::coordinates::{extract_selected_text, PanelLayout};
 use super::git::{
@@ -418,6 +425,9 @@ fn run_app_internal(
     let mut pending_events: VecDeque<Event> = VecDeque::new();
     let mut saved_annotations = None;
     let mut needs_redraw = true;
+    let mut scroll_only_redraw = false;
+    let mut next_scroll_frame = Instant::now();
+    const SCROLL_FRAME_INTERVAL: Duration = Duration::from_micros(33_333);
 
     'main: loop {
         if let Some(ref rx) = watch_rx {
@@ -456,7 +466,11 @@ fn run_app_internal(
             }
         }
 
-        if needs_redraw || state.change_flash_started.is_some() {
+        // Limit continuous scrolling to 30 frames/s while consuming input as it
+        // arrives. A tap after an idle interval has no added delay.
+        if (needs_redraw || state.change_flash_started.is_some())
+            && (!scroll_only_redraw || Instant::now() >= next_scroll_frame)
+        {
             if state.change_flash_started
                 .is_some_and(|start| start.elapsed() >= Duration::from_secs(1))
             {
@@ -646,6 +660,8 @@ fn run_app_internal(
                 state.editor_rect = editor_rect_cell.get();
             }
             needs_redraw = false;
+            scroll_only_redraw = false;
+            next_scroll_frame = Instant::now() + SCROLL_FRAME_INTERVAL;
         }
 
         // Poll for new events if no pending events
@@ -656,8 +672,21 @@ fn run_app_internal(
         } else {
             100
         };
-        if pending_events.is_empty() && event::poll(Duration::from_millis(poll_ms))? {
+        let poll_timeout = if needs_redraw && scroll_only_redraw {
+            next_scroll_frame.saturating_duration_since(Instant::now())
+        } else {
+            Duration::from_millis(poll_ms)
+        };
+        if pending_events.is_empty() && event::poll(poll_timeout)? {
             pending_events.push_back(event::read()?);
+        }
+        if needs_redraw && scroll_only_redraw
+            && pending_events.front().is_some_and(|event| !is_scroll_event(event))
+        {
+            // Clicks, annotation commands, and other actions need the current
+            // visible geometry. Draw before consuming them, even between ticks.
+            scroll_only_redraw = false;
+            continue;
         }
 
         // Drain ready scrolling keys before drawing. Never wait to form a batch,
@@ -665,12 +694,14 @@ fn run_app_internal(
         let batch_started = Instant::now();
         let mut batch_count = 0;
         while let Some(mut current_event) = pending_events.pop_front() {
-            needs_redraw = true;
-            let batch_scroll = active_modal.is_none()
+            let scroll_context = active_modal.is_none()
                 && annotation_editor.is_none()
                 && !state.search_state.is_active()
-                && state.focused_panel == FocusedPanel::DiffView
-                && is_scroll_key(&current_event);
+                && state.focused_panel == FocusedPanel::DiffView;
+            let scroll_event = scroll_context && is_scroll_event(&current_event);
+            scroll_only_redraw = scroll_event && (!needs_redraw || scroll_only_redraw);
+            needs_redraw = true;
+            let batch_scroll = scroll_context && is_scroll_key(&current_event);
             if batch_scroll {
                 if let Event::Key(ref mut key) = current_event {
                     // Enhanced keyboard protocols can report held keys as Repeat.
