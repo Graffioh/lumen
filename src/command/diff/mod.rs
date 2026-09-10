@@ -29,7 +29,7 @@ pub struct DiffOptions {
     pub reference: Option<CommitReference>,
     pub pr: Option<String>,
     pub detect_pr: bool,
-    pub worktree: bool,
+    pub worktree_guidance: bool,
     pub file: Option<Vec<String>>,
     pub watch: bool,
     pub theme: Option<String>,
@@ -55,7 +55,7 @@ pub struct PrInfo {
 }
 
 impl PrInfo {
-    fn annotation_context(&self, worktree: bool) -> String {
+    fn annotation_context(&self, worktree_guidance: bool) -> String {
         let source = self
             .head_repo
             .as_ref()
@@ -70,7 +70,7 @@ impl PrInfo {
             self.repo_owner, self.repo_name, self.number,
             self.base_repo_owner, self.repo_name, source, self.head_ref, self.head_commit,
         );
-        if worktree {
+        if worktree_guidance {
             context.push_str(
                 "\n\n## Worktree instructions for the coding agent\n\n\
                  Apply the annotations below in a worktree associated with this PR.\n\n\
@@ -472,10 +472,10 @@ pub fn run_diff_ui(mut options: DiffOptions, backend: &dyn VcsBackend) -> io::Re
         }
     }
 
-    if options.worktree {
+    if options.worktree_guidance {
         return Err(io::Error::new(
             io::ErrorKind::InvalidInput,
-            "--worktree requires a pull request (URL, number, --pr, or --detect-pr)",
+            "--worktree-guidance requires a pull request (URL, number, --pr, or --detect-pr)",
         ));
     }
 

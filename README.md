@@ -280,48 +280,43 @@ export LUMEN_AI_MODEL="gpt-5-mini"
 
 ## Coding Agent Integrations 🔅
 
-Use lumen as the review surface for your coding agent. Open lumen in an interactive
-terminal, annotate the diff inline, and press `s` to export your annotations. Return
-that text to the agent, either through a compatible terminal integration or by
-copying it into the conversation.
+Open lumen in an interactive terminal, annotate with `i`, and press `s` → `Enter`.
+Lumen saves your annotations to a unique Markdown file in `/tmp`, exits, and prints
+the command to load them into Codex:
 
+```text
+Saved annotations to /tmp/lumen-pr-123-aB3dE6gH9jKl.md
+
+In Codex, run:
+!cat /tmp/lumen-pr-123-aB3dE6gH9jKl.md
+
+Then ask Codex to apply the annotations.
 ```
-agent finishes turn → lumen diff → annotate → press `s`
-→ annotations on stdout → return feedback to the agent
-```
 
-The mechanics are just stdin/stdout — no plugins, no extensions:
+No output redirection or filename is needed. PR reviews use `lumen-pr-<number>-`
+and other diffs use `lumen-review-`, followed by a random suffix. Each send creates
+a separate file without overwriting earlier reviews. Files remain available after
+Lumen exits, until you or the system clean `/tmp`. If saving fails, the viewer
+stays open so you can retry. Press `q` to exit without saving a handoff.
 
-- `s` in the diff TUI opens a confirmation modal. On `Enter`, lumen exits and writes the formatted annotations to stdout (the same text `y` copies to your clipboard).
-- The TUI auto-routes to `/dev/tty` when stdout is captured, so the agent receives clean text — no escape codes.
-
-The host must give Lumen an interactive terminal; a shell command facility alone
-is not sufficient. Codex CLI 0.154.0 detaches `!` shell commands from the terminal,
-so use a normal terminal pane and copy/export the annotations back to Codex.
-When stdout is redirected, `s` writes only the annotations; progress goes to stderr.
-
-Examples:
-
-| Agent | How to trigger |
-|-------|----------------|
-| Claude Code | `!lumen diff` |
-| Codex | Run in an interactive terminal; return the exported annotations to the session |
-| Any agent with shell access | `lumen diff` from a tool/bash call |
-
-Annotate with `i` (selection / hunk / file), press `s` → `Enter` to send. Press `q` to dismiss without sending.
+The file contains the same formatted annotations available through the annotations
+menu. Other coding agents can read the file or receive its contents in conversation.
+The host must give Lumen an interactive terminal; Codex CLI 0.154.0 detaches `!`
+shell commands from the terminal, so open Lumen in a normal terminal pane and use
+`!cat` in Codex afterward.
 
 ### PR annotations with worktree instructions
 
 ```sh
-lumen diff https://github.com/owner/repo/pull/123 --worktree
+lumen diff https://github.com/owner/repo/pull/123 --worktree-guidance
 ```
 
 The URL must identify a pull request, not just a repository. Annotate with `i`,
 then press `s` and `Enter` to send. All PR annotation exports include the PR URL,
 actual source repository, source branch, and reviewed head commit.
 
-`--worktree` adds instructions asking the receiving coding agent to find a matching
-local repository, inspect its registered worktrees, and reuse the PR's existing
+`--worktree-guidance` asks the receiving coding agent to find a matching local
+repository, inspect its registered worktrees, and reuse the PR's existing
 worktree. A clean, behind worktree can be fast-forwarded; existing edits and local
 commits must be preserved. The agent should create a worktree only when no matching
 one exists, and check annotation locations if the source branch has advanced since

@@ -59,13 +59,11 @@ chrono = { version = "0.4", optional = true }
 pollster = { version = "0.4", optional = true }
 futures = { version = "0.3", optional = true }
 terminal-light = "1.8.0"
+tempfile = "3"
 
 [features]
 default = ["jj"]
 jj = ["jj-lib", "chrono", "pollster", "futures"]
-
-[dev-dependencies]
-tempfile = "3"
 
 [profile.release]
 lto = true

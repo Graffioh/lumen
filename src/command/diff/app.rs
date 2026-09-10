@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::io::{self, IsTerminal, Write};
+use std::path::PathBuf;
 use std::sync::mpsc::TryRecvError;
 use std::time::Duration;
 
@@ -17,7 +18,7 @@ use ratatui::prelude::*;
 /// Writer that drives the TUI. Falls back to /dev/tty when stdout is
 /// captured (e.g. when an agent shim does `output=$(lumen diff)`),
 /// so the alternate-screen escapes don't pollute the captured stdout
-/// and we can reserve stdout for the annotation payload (`s` keybind).
+/// and we can reserve stdout for the annotation handoff command (`s` keybind).
 fn open_tui_writer() -> io::Result<Box<dyn Write + Send>> {
     if io::stdout().is_terminal() {
         return Ok(Box::new(io::stdout()));
@@ -325,7 +326,7 @@ fn run_app_internal(
     state.set_diff_reference(diff_ref_str);
     state.annotation_context = pr_info
         .as_ref()
-        .map(|pr| pr.annotation_context(options.worktree));
+        .map(|pr| pr.annotation_context(options.worktree_guidance));
 
     // Initialize stacked mode if commits were provided
     if let Some(commits) = stacked_commits {
@@ -377,7 +378,7 @@ fn run_app_internal(
     let mut annotation_editor: Option<AnnotationEditor> = None;
     let mut pending_watch_event: Option<WatchEvent> = None;
     let mut pending_events: VecDeque<Event> = VecDeque::new();
-    let mut send_annotations_on_exit = false;
+    let mut saved_annotations = None;
 
     'main: loop {
         if let Some(ref rx) = watch_rx {
@@ -813,8 +814,22 @@ fn run_app_internal(
                                     }
                                 }
                                 ModalResult::Confirmed => {
-                                    send_annotations_on_exit = true;
-                                    break 'main;
+                                    let formatted = state.format_annotations_for_export();
+                                    match save_annotations(
+                                        &formatted,
+                                        pr_info.as_ref().map(|pr| pr.number),
+                                    ) {
+                                        Ok(path) => {
+                                            saved_annotations = Some(path);
+                                            break 'main;
+                                        }
+                                        Err(error) => {
+                                            active_modal = Some(Modal::confirm(
+                                                "Could not save annotations",
+                                                format!("{}\n\nYour annotations are still open. Press Enter to retry or Esc to return.", error),
+                                            ));
+                                        }
+                                    }
                                 }
                                 ModalResult::JumpToLine {
                                     file_index,
@@ -1875,11 +1890,11 @@ fn run_app_internal(
                                 let n = state.annotations.len();
                                 let noun = if n == 1 { "annotation" } else { "annotations" };
                                 let mut msg = format!(
-                                    "Exit lumen and write {} {} to stdout?\n\n\
-                                     Use this to pipe feedback back to a coding agent.",
+                                    "Save {} {} to a unique file in /tmp and exit lumen?\n\n\
+                                     Lumen will print the !cat command to load them in Codex.",
                                     n, noun,
                                 );
-                                if options.worktree {
+                                if options.worktree_guidance {
                                     msg.push_str("\n\nIncludes instructions for the agent to reuse or prepare the PR worktree.");
                                 }
                                 active_modal = Some(Modal::confirm("Send annotations", msg));
@@ -2197,7 +2212,7 @@ fn run_app_internal(
                                             },
                                             KeyBind {
                                                 key: "s",
-                                                description: "Exit & send annotations to stdout",
+                                                description: "Save annotations & show agent command",
                                             },
                                         ],
                                     },
@@ -2220,15 +2235,32 @@ fn run_app_internal(
     )?;
     disable_raw_mode()?;
 
-    if send_annotations_on_exit {
-        let formatted = state.format_annotations_for_export();
+    if let Some(path) = saved_annotations {
         let stdout = io::stdout();
         let mut handle = stdout.lock();
-        handle.write_all(formatted.as_bytes())?;
-        handle.write_all(b"\n")?;
+        writeln!(handle, "Saved annotations to {}\n", path.display())?;
+        writeln!(handle, "In Codex, run:\n!cat {}", path.display())?;
+        writeln!(handle, "\nThen ask Codex to apply the annotations.")?;
     }
 
     Ok(())
+}
+
+/// Persist each send separately, without overwriting a previous review.
+fn save_annotations(formatted: &str, pr_number: Option<u64>) -> io::Result<PathBuf> {
+    let prefix = match pr_number {
+        Some(number) => format!("lumen-pr-{}-", number),
+        None => "lumen-review-".to_string(),
+    };
+    let mut file = tempfile::Builder::new()
+        .prefix(&prefix)
+        .suffix(".md")
+        .rand_bytes(12)
+        .tempfile_in("/tmp")?;
+    file.write_all(formatted.as_bytes())?;
+    file.flush()?;
+    let (_, path) = file.keep().map_err(|error| error.error)?;
+    Ok(path)
 }
 
 fn open_url(url: &str) -> io::Result<()> {
@@ -2255,4 +2287,41 @@ fn generate_file_anchor(filename: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(filename.as_bytes());
     format!("{:x}", hasher.finalize())
+}
+
+#[cfg(test)]
+mod annotation_handoff_tests {
+    use super::save_annotations;
+
+    #[test]
+    fn sends_persist_unique_files_with_exact_contents() {
+        let first = save_annotations("First review\n", Some(720)).unwrap();
+        let second = save_annotations("Second review\n", Some(720)).unwrap();
+        let local = save_annotations("Local review\n", None).unwrap();
+        assert_ne!(first, second);
+        for (path, expected, prefix) in [
+            (&first, "First review\n", "lumen-pr-720-"),
+            (&second, "Second review\n", "lumen-pr-720-"),
+            (&local, "Local review\n", "lumen-review-"),
+        ] {
+            assert_eq!(path.parent().unwrap(), std::path::Path::new("/tmp"));
+            assert!(path
+                .file_name()
+                .unwrap()
+                .to_str()
+                .unwrap()
+                .starts_with(prefix));
+            assert_eq!(path.extension().unwrap(), "md");
+            assert_eq!(std::fs::read_to_string(path).unwrap(), expected);
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                assert_eq!(
+                    std::fs::metadata(path).unwrap().permissions().mode() & 0o777,
+                    0o600
+                );
+            }
+            std::fs::remove_file(path).unwrap();
+        }
+    }
 }

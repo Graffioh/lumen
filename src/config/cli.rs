@@ -122,7 +122,7 @@ pub enum Commands {
 
         /// Include instructions for the agent to reuse or prepare a PR worktree
         #[arg(long)]
-        worktree: bool,
+        worktree_guidance: bool,
 
         /// Filter to specific files
         #[arg(short, long)]
@@ -179,16 +179,18 @@ mod tests {
     }
 
     #[test]
-    fn test_diff_worktree_flag_parses_with_pr_url() {
+    fn test_diff_worktree_guidance_flag_parses_with_pr_url() {
         let cli = Cli::try_parse_from([
             "lumen",
             "diff",
-            "--worktree",
+            "--worktree-guidance",
             "https://github.com/upstream/project/pull/42",
         ])
         .unwrap();
         match cli.command {
-            Commands::Diff { worktree, .. } => assert!(worktree),
+            Commands::Diff {
+                worktree_guidance, ..
+            } => assert!(worktree_guidance),
             _ => panic!("expected diff command"),
         }
     }
