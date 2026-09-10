@@ -349,7 +349,8 @@ fn run_app_internal(
     // Now enter TUI mode. Use /dev/tty when stdout is captured so the
     // alternate-screen escapes go to the real terminal, not the pipe.
     enable_raw_mode()?;
-    let mut tui_writer = open_tui_writer()?;
+    // Batch a frame before flushing to the terminal (especially /dev/tty).
+    let mut tui_writer = io::BufWriter::with_capacity(64 * 1024, open_tui_writer()?);
     execute!(tui_writer, EnterAlternateScreen, EnableMouseCapture)?;
     // Opt into the kitty keyboard protocol so terminals that support it
     // (iTerm2 ≥3.5, kitty, wezterm, alacritty) deliver disambiguated key
@@ -439,7 +440,11 @@ fn run_app_internal(
                 .viewed_hunks
                 .get(&diff.filename)
                 .unwrap_or(&empty_viewed_hunks);
-            let branch_fallback = get_current_branch(backend);
+            let branch_fallback = if state.diff_reference.is_none() {
+                get_current_branch(backend)
+            } else {
+                String::new()
+            };
             let commit_ref = state.diff_reference.as_deref().unwrap_or(&branch_fallback);
             let navigation_cell = std::cell::RefCell::new(Default::default());
             let row_offset = std::cell::Cell::new(0usize);
@@ -495,6 +500,7 @@ fn run_app_internal(
                     state.total_added,
                     state.total_removed,
                     annotation_editor.as_ref(),
+                    &state.navigation_layout,
                 );
                 *navigation_cell.borrow_mut() = navigation;
                 row_offset.set(offset);

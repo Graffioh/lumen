@@ -1288,6 +1288,7 @@ pub fn render_diff(
     total_added: usize,
     total_removed: usize,
     editor: Option<&AnnotationEditor>,
+    navigation_cache: &std::cell::RefCell<Option<crate::command::diff::change_nav::NavigationLayout>>,
 ) -> (usize, Vec<(usize, usize)>, Vec<(u64, Rect)>, Option<Rect>, ChangeNavigation) {
     let area = frame.area();
     let t = theme::get();
@@ -1425,50 +1426,6 @@ pub fn render_diff(
         .collect();
     let file_slots = build_file_slots(&file_annotations, editor, &diff.filename);
     let line_slots = build_line_slots(&line_annotations, editor, &diff.filename);
-    let rows: Vec<_> = side_by_side
-        .iter()
-        .map(|line| {
-            let height = [&line.old_line, &line.new_line]
-                .into_iter()
-                .flatten()
-                .map(|(num, text)| {
-                    if !settings.wrap {
-                        return 1;
-                    }
-                    wrapped_diff_lines(
-                        vec![Span::raw(format!(" {:4} ", num))],
-                        vec![Span::raw(crate::command::diff::types::expand_tabs(
-                            text,
-                            settings.tab_width,
-                        ))],
-                        target_width,
-                        bg,
-                        true,
-                    )
-                    .len()
-                })
-                .max()
-                .unwrap_or(1);
-            let overlays: usize = line_slots
-                .iter()
-                .filter(|slot| {
-                    if let AnnotationTarget::LineRange {
-                        panel, end_line, ..
-                    } = slot.target()
-                    {
-                        line.line_number(*panel) == Some(*end_line)
-                    } else {
-                        false
-                    }
-                })
-                .map(|slot| slot.height())
-                .sum();
-            (
-                !matches!(line.change_type, ChangeType::Equal),
-                height + overlays,
-            )
-        })
-        .collect();
     let context_reserve = if settings.context.enabled {
         settings.context.max_lines
     } else {
@@ -1476,11 +1433,97 @@ pub fn render_diff(
     };
     let budget = (main_area.height as usize)
         .saturating_sub(4 + context_reserve + file_slots_height(&file_slots));
+    use crate::command::diff::change_nav::{NavigationLayout, NavigationLayoutKey};
+    let key = NavigationLayoutKey {
+        file: current_file,
+        width: target_width,
+        budget,
+        wrap: settings.wrap,
+        tab_width: settings.tab_width,
+        overlays: line_slots
+            .iter()
+            .filter_map(|slot| {
+                if let AnnotationTarget::LineRange {
+                    panel, end_line, ..
+                } = slot.target()
+                {
+                    Some((*panel, *end_line, slot.height()))
+                } else {
+                    None
+                }
+            })
+            .collect(),
+    };
+    let mut cached_layout = navigation_cache.borrow_mut();
+    if cached_layout.as_ref().map(|layout| &layout.key) != Some(&key) {
+        let rows: Vec<_> = side_by_side
+            .iter()
+            .map(|line| {
+                let height = [&line.old_line, &line.new_line]
+                    .into_iter()
+                    .flatten()
+                    .map(|(num, text)| {
+                        if !settings.wrap {
+                            return 1;
+                        }
+                        wrapped_diff_lines(
+                            vec![Span::raw(format!(" {:4} ", num))],
+                            vec![Span::raw(crate::command::diff::types::expand_tabs(
+                                text,
+                                settings.tab_width,
+                            ))],
+                            target_width,
+                            bg,
+                            true,
+                        )
+                        .len()
+                    })
+                    .max()
+                    .unwrap_or(1);
+                let overlays: usize = line_slots
+                    .iter()
+                    .filter(|slot| {
+                        if let AnnotationTarget::LineRange {
+                            panel, end_line, ..
+                        } = slot.target()
+                        {
+                            line.line_number(*panel) == Some(*end_line)
+                        } else {
+                            false
+                        }
+                    })
+                    .map(|slot| slot.height())
+                    .sum();
+                (
+                    !matches!(line.change_type, ChangeType::Equal),
+                    height + overlays,
+                )
+            })
+            .collect();
+        let groups = group_changes(&rows, budget);
+        let scroll_targets = groups
+            .iter()
+            .map(|group| {
+                crate::command::diff::change_nav::centered_scroll(
+                    &rows,
+                    group,
+                    budget.saturating_add(2),
+                )
+            })
+            .collect();
+        *cached_layout = Some(NavigationLayout {
+            key,
+            rows,
+            groups,
+            scroll_targets,
+        });
+    }
+    let layout = cached_layout.as_ref().unwrap();
+    let rows = &layout.rows;
     let anchor = focused_change.or_else(|| focused_hunk.and_then(|i| hunks.get(i).copied()));
-    let mut navigation = ChangeNavigation::new(group_changes(&rows, budget), anchor, footer_area);
-    navigation.scroll_targets = navigation.groups.iter().map(|group| {
-        crate::command::diff::change_nav::centered_scroll(&rows, group, budget.saturating_add(2))
-    }).collect();
+    let mut navigation = ChangeNavigation::new(layout.groups.clone(), anchor, footer_area);
+    navigation.scroll_targets.clone_from(&layout.scroll_targets);
+
     let focused_range = navigation.selected.map(|i| &navigation.groups[i]);
 
     // Track how many non-diff rows are at the top (context lines + file annotations)

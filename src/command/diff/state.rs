@@ -175,6 +175,7 @@ pub struct AppState {
     pub focused_change: Option<usize>,
     pub change_flash_started: Option<Instant>,
     pub change_navigation: super::change_nav::ChangeNavigation,
+    pub navigation_layout: std::cell::RefCell<Option<super::change_nav::NavigationLayout>>,
     // Annotation fields
     pub annotations: Vec<Annotation>,
     annotation_next_id: u64,
@@ -314,6 +315,7 @@ impl AppState {
             focused_change: None,
             change_flash_started: None,
             change_navigation: Default::default(),
+            navigation_layout: Default::default(),
             annotations: Vec::new(),
             annotation_next_id: 0,
             stacked_mode: false,
@@ -529,6 +531,7 @@ impl AppState {
         self.focused_change = None;
         self.change_flash_started = None;
         self.change_navigation = Default::default();
+        *self.navigation_layout.get_mut() = None;
         self.cached_side_by_side = None;
         self.cached_hunks = None;
         self.cached_total_lines = None;

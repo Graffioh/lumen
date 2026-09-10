@@ -2,6 +2,24 @@ use std::ops::Range;
 
 use ratatui::layout::Rect;
 
+/// Inputs that affect group geometry. File reloads also invalidate this cache.
+#[derive(PartialEq)]
+pub struct NavigationLayoutKey {
+    pub file: usize,
+    pub width: usize,
+    pub budget: usize,
+    pub wrap: bool,
+    pub tab_width: usize,
+    pub overlays: Vec<(super::types::DiffPanelFocus, usize, usize)>,
+}
+
+pub struct NavigationLayout {
+    pub key: NavigationLayoutKey,
+    pub rows: Vec<(bool, usize)>,
+    pub groups: Vec<Range<usize>>,
+    pub scroll_targets: Vec<usize>,
+}
+
 /// Navigation targets are side-by-side row ranges, sized for the current viewport.
 #[derive(Default)]
 pub struct ChangeNavigation {

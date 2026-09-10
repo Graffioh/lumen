@@ -234,7 +234,7 @@ pub fn get_language_context(filename: &str) -> Option<&'static LanguageContext> 
 
 /// Compute context lines for a given scroll position using tree-sitter AST.
 ///
-/// This function parses the source code, finds all context-worthy nodes (functions,
+/// This function queries the cached syntax tree for context-worthy nodes (functions,
 /// classes, loops, etc.), and returns the ones that contain the scroll position
 /// but start above it (i.e., not fully visible).
 pub fn compute_context_lines(
@@ -261,11 +261,11 @@ pub fn compute_context_lines(
 
     let mut cursor = QueryCursor::new();
 
-    let start_point = Point::new(0, 0);
-    let end_point = Point::new(scroll_position, 0);
+    // Only scopes intersecting the viewport start can become sticky headers.
+    // Searching from the file start revisits every preceding scope on each scroll.
+    let start_point = Point::new(scroll_position, 0);
+    let end_point = Point::new(scroll_position.saturating_add(1), 0);
     cursor.set_point_range(start_point..end_point);
-
-    let lines: Vec<&str> = source.lines().collect();
 
     // Collect all context nodes that contain the scroll position but start above it
     let mut context_nodes: Vec<(usize, usize, String)> = Vec::new(); // (start_line, end_line, first_line_content)
@@ -281,7 +281,10 @@ pub fn compute_context_lines(
             // 1. Start before the scroll position (not visible at top)
             // 2. End at or after the scroll position (still contains current view)
             if start_line < scroll_position && end_line >= scroll_position {
-                if let Some(line_content) = lines.get(start_line) {
+                let line_start = source[..node.start_byte()]
+                    .rfind('\n')
+                    .map_or(0, |i| i + 1);
+                if let Some(line_content) = source[line_start..].lines().next() {
                     context_nodes.push((
                         start_line,
                         end_line,
@@ -335,6 +338,44 @@ mod tests {
 
         return tree_cache;
 
+    }
+
+    #[test]
+    fn viewport_query_preserves_context_across_scopes_and_boundaries() {
+        for (filename, source) in [
+            ("test.rs", "fn before() {}\nimpl Example {\n    fn work() {\n        match value {\n            _ => (),\n        }\n    }\n}\nfn after() {}\n"),
+            ("test.py", "def before():\n    pass\nclass Example:\n    def work(self):\n        for item in items:\n            print(item)\n\ndef after():\n    pass\n"),
+            ("test.ts", "function before() {}\nclass Example {\n    work() {\n        const f = () => {\n            return 1;\n        };\n    }\n}\nfunction after() {}\n"),
+            ("test.go", "package example\nfunc before() {}\nfunc work() {\n    for i := 0; i < 3; i++ {\n        println(i)\n    }\n}\nfunc after() {}\n"),
+        ] {
+            let trees = get_tree_cache(filename, source);
+            let config = ContextConfig::default();
+            let Some(lang) = get_language_context(filename) else {
+                assert!(compute_context_lines(source, filename, &trees, 1, &config, 4).is_empty());
+                continue;
+            };
+            for row in 1..=source.lines().count() + 1 {
+                // Reference: the original query searched everything above the viewport.
+                let mut cursor = QueryCursor::new();
+                cursor.set_point_range(Point::new(0, 0)..Point::new(row, 0));
+                let mut matches = cursor.matches(&lang.query, trees[filename].root_node(), source.as_bytes());
+                let mut expected = Vec::new();
+                while let Some(found) = matches.next() {
+                    for capture in found.captures {
+                        let start = capture.node.start_position().row;
+                        if start < row && capture.node.end_position().row >= row {
+                            expected.push((start + 1, source.lines().nth(start).unwrap().to_string()));
+                        }
+                    }
+                }
+                expected.sort_by_key(|entry| entry.0);
+                expected.dedup_by_key(|entry| entry.0);
+                expected.truncate(config.max_lines);
+                let actual: Vec<_> = compute_context_lines(source, filename, &trees, row, &config, 4)
+                    .into_iter().map(|line| (line.line_number, line.content)).collect();
+                assert_eq!(actual, expected, "{filename} at row {row}");
+            }
+        }
     }
 
     #[test]
