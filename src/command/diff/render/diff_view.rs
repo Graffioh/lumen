@@ -1272,6 +1272,7 @@ pub fn render_diff(
     pr_info: Option<&PrInfo>,
     focused_hunk: Option<usize>,
     focused_change: Option<usize>,
+    change_flash: f32,
     hunks: &[usize],
     stacked_mode: bool,
     stacked_commit: Option<&StackedCommitInfo>,
@@ -1487,6 +1488,7 @@ pub fn render_diff(
     let mut annotation_rects: Vec<(u64, Rect)> = Vec::new();
     // Tracks the screen rect of the inline editor, when one is rendered this frame.
     let mut editor_rect: Option<Rect> = None;
+    let mut flash_rows: Option<std::ops::Range<usize>> = None;
 
     let border_style = Style::default().fg(t.ui.border_unfocused);
     let title_style = if focused_panel == FocusedPanel::DiffView {
@@ -1571,6 +1573,7 @@ pub fn render_diff(
 
         for (i, diff_line) in visible_lines.iter().enumerate() {
             let line_idx = scroll_usize + i;
+            let painted_start = new_lines.len();
             let new_selection_range =
                 get_selection_range_for_line(line_idx, DiffPanelFocus::New, selection);
             let in_annotation = is_in_ann_range(line_idx, None, &ann_index_ranges);
@@ -1640,6 +1643,10 @@ pub fn render_diff(
                         slot_overlays.push((line_pos, slot));
                     }
                 }
+            }
+            if focused_range.is_some_and(|range| range.contains(&line_idx)) {
+                let start = flash_rows.as_ref().map_or(painted_start, |r| r.start);
+                flash_rows = Some(start..new_lines.len());
             }
         }
 
@@ -1747,6 +1754,7 @@ pub fn render_diff(
 
         for (i, diff_line) in visible_lines.iter().enumerate() {
             let line_idx = scroll_usize + i;
+            let painted_start = old_lines.len();
             let old_selection_range =
                 get_selection_range_for_line(line_idx, DiffPanelFocus::Old, selection);
             let in_annotation = is_in_ann_range(line_idx, None, &ann_index_ranges);
@@ -1816,6 +1824,10 @@ pub fn render_diff(
                         slot_overlays.push((line_pos, slot));
                     }
                 }
+            }
+            if focused_range.is_some_and(|range| range.contains(&line_idx)) {
+                let start = flash_rows.as_ref().map_or(painted_start, |r| r.start);
+                flash_rows = Some(start..old_lines.len());
             }
         }
 
@@ -2006,6 +2018,7 @@ pub fn render_diff(
 
         for (i, diff_line) in visible_lines.iter().enumerate() {
             let line_idx = scroll_usize + i;
+            let painted_start = old_lines.len().max(new_lines.len());
             let in_focused = is_in_focused_hunk(line_idx, diff_line.change_type);
             let hunk_viewed = is_line_in_viewed_hunk(line_idx, diff_line.change_type);
             let mut style = DiffLineStyle::for_change_type(diff_line.change_type, bg, t);
@@ -2306,6 +2319,11 @@ pub fn render_diff(
                     }
                 }
             }
+            if focused_range.is_some_and(|range| range.contains(&line_idx)) {
+                let start = flash_rows.as_ref().map_or(painted_start, |r| r.start);
+                flash_rows = Some(start..old_lines.len().max(new_lines.len()));
+            }
+
         }
 
         if let Some(area) = old_area {
@@ -2436,6 +2454,24 @@ pub fn render_diff(
                 }
             }
         }
+    }
+
+    if let Some(rows) = flash_rows.filter(|_| change_flash > 0.0 && editor.is_none()) {
+        let top = (main_area.y as usize + rows.start)
+            .min(main_area.bottom().saturating_sub(1) as usize) as u16;
+        let bottom = (main_area.y as usize + 1 + rows.end)
+            .min(main_area.bottom().saturating_sub(1) as usize) as u16;
+        crate::command::diff::change_nav::draw_flash(
+            frame,
+            Rect::new(
+                main_area.x,
+                top,
+                main_area.width,
+                bottom.saturating_sub(top) + 1,
+            ),
+            change_flash,
+            bg,
+        );
     }
 
     // Merge the sidebar's right border with the diff panel's left border into

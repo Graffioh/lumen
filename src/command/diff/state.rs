@@ -1,5 +1,5 @@
 use std::collections::{HashMap, HashSet};
-use std::time::SystemTime;
+use std::time::{Instant, SystemTime};
 
 use tree_sitter::{Parser, Tree};
 
@@ -173,6 +173,7 @@ pub struct AppState {
     pub watching: bool,
     pub focused_hunk: Option<usize>,
     pub focused_change: Option<usize>,
+    pub change_flash_started: Option<Instant>,
     pub change_navigation: super::change_nav::ChangeNavigation,
     // Annotation fields
     pub annotations: Vec<Annotation>,
@@ -311,6 +312,7 @@ impl AppState {
             watching: false,
             focused_hunk,
             focused_change: None,
+            change_flash_started: None,
             change_navigation: Default::default(),
             annotations: Vec::new(),
             annotation_next_id: 0,
@@ -525,6 +527,7 @@ impl AppState {
     /// Invalidate the cache (call when file changes)
     pub fn invalidate_cache(&mut self) {
         self.focused_change = None;
+        self.change_flash_started = None;
         self.change_navigation = Default::default();
         self.cached_side_by_side = None;
         self.cached_hunks = None;
@@ -874,7 +877,9 @@ impl AppState {
     }
 
     pub fn navigate_change_group(&mut self, forward: bool) {
-        let Some(index) = self.change_navigation.target(forward) else {
+        let Some(index) = self.change_navigation.target(forward)
+            .or(self.change_navigation.selected)
+        else {
             return;
         };
         let start = self.change_navigation.groups[index].start;
@@ -882,6 +887,7 @@ impl AppState {
         self.clear_selection();
         self.focused_panel = FocusedPanel::DiffView;
         self.focused_change = Some(start);
+        self.change_flash_started = Some(Instant::now());
         self.focused_hunk = self.get_hunks().iter().rposition(|&row| row <= start);
         self.scroll = start.min(u16::MAX as usize) as u16;
         self.h_scroll = 0;

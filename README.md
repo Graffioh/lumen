@@ -309,7 +309,9 @@ shell commands from the terminal, so open Lumen in a normal terminal pane and us
 
 The bottom-center arrows (`← 1 / 3 →`) jump between groups of changes in the
 selected file. Click an arrow or press **Alt+Left / Alt+Right**. The active group's
-changed lines have a highlighted gutter marker.
+changed lines have a highlighted gutter marker. Each jump also briefly outlines
+the group in muted yellow, fading away over one second without moving the code.
+Mac Option+arrow word-navigation sequences (`Esc+b` / `Esc+f`) are supported too.
 
 Nearby changes are grouped when they fit together on screen, including the lines
 between them. Large changes are split into smaller stops. Groups adapt to the

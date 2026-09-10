@@ -477,6 +477,9 @@ fn run_app_internal(
                     pr_info.as_ref(),
                     state.focused_hunk,
                     state.focused_change,
+                    state.change_flash_started
+                        .map(|start| super::change_nav::flash_strength(start.elapsed()))
+                        .unwrap_or(0.0),
                     &hunks,
                     state.stacked_mode,
                     state.current_commit(),
@@ -592,7 +595,14 @@ fn run_app_internal(
         }
 
         // Poll for new events if no pending events
-        if pending_events.is_empty() && event::poll(Duration::from_millis(100))? {
+        let poll_ms = if state.change_flash_started
+            .is_some_and(|start| start.elapsed() < Duration::from_secs(1))
+        {
+            33
+        } else {
+            100
+        };
+        if pending_events.is_empty() && event::poll(Duration::from_millis(poll_ms))? {
             pending_events.push_back(event::read()?);
         }
 
@@ -1501,10 +1511,10 @@ fn run_app_internal(
                                 }
                             }
                         }
-                        KeyCode::Left | KeyCode::Right
-                            if key.modifiers.contains(KeyModifiers::ALT) =>
-                        {
-                            state.navigate_change_group(key.code == KeyCode::Right);
+                        _ if super::change_nav::navigation_key(key).is_some() => {
+                            state.navigate_change_group(
+                                super::change_nav::navigation_key(key).unwrap(),
+                            );
                         }
                         KeyCode::Char('h') | KeyCode::Left => {
                             if state.focused_panel == FocusedPanel::DiffView && !state.settings.wrap
@@ -1721,6 +1731,7 @@ fn run_app_internal(
                                 };
                                 if !hunks.is_empty() {
                                     state.focused_change = None;
+                                    state.change_flash_started = None;
                                     state.focused_hunk = Some(next_hunk);
                                     state.scroll = adjust_scroll_for_hunk(
                                         hunks[next_hunk],
@@ -1746,6 +1757,7 @@ fn run_app_internal(
                                 };
                                 if !hunks.is_empty() {
                                     state.focused_change = None;
+                                    state.change_flash_started = None;
                                     state.focused_hunk = Some(prev_hunk);
                                     state.scroll = adjust_scroll_for_hunk(
                                         hunks[prev_hunk],
