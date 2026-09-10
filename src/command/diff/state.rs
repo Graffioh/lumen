@@ -185,6 +185,8 @@ pub struct AppState {
     pub vcs_name: &'static str,
     /// The commit reference used to open the diff (e.g., "HEAD~2..HEAD", "main..feature")
     pub diff_reference: Option<String>,
+    /// PR source metadata and optional worktree instructions included with annotations.
+    pub annotation_context: Option<String>,
     // Selection state
     /// Which panel has selection focus
     pub diff_panel_focus: DiffPanelFocus,
@@ -314,6 +316,7 @@ impl AppState {
             stacked_viewed_files: HashMap::new(),
             vcs_name: "git", // Default, will be set by caller
             diff_reference: None,
+            annotation_context: None,
             diff_panel_focus: DiffPanelFocus::default(),
             selection: Selection::default(),
             is_dragging: false,
@@ -916,6 +919,11 @@ impl AppState {
             result.push_str(&format!("# {}\n\n", reference));
         }
 
+        if let Some(ref context) = self.annotation_context {
+            result.push_str(context);
+            result.push_str("\n\n");
+        }
+
         for (i, ann) in self.annotations.iter().enumerate() {
             if i > 0 {
                 result.push_str("---\n\n");
@@ -1017,6 +1025,21 @@ mod tests {
             status: FileStatus::Added,
             is_binary: false,
         }
+    }
+
+    #[test]
+    fn annotation_export_includes_handoff_before_comments() {
+        let mut state = AppState::new(vec![make_file_diff("src/main.rs")], None);
+        state.annotation_context = Some("PR source and worktree instructions".to_string());
+        state.add_annotation(
+            "src/main.rs".to_string(),
+            AnnotationTarget::File,
+            "Fix this in the PR".to_string(),
+            SystemTime::now(),
+        );
+        let output = state.format_annotations_for_export();
+        assert!(output.starts_with("PR source and worktree instructions\n\n"));
+        assert!(output.contains("**src/main.rs**\n\nFix this in the PR"));
     }
 
     #[test]

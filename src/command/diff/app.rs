@@ -55,7 +55,7 @@ use super::watcher::{setup_watcher, WatchEvent};
 use super::{
     fetch_viewed_files, mark_file_as_viewed_async, unmark_file_as_viewed_async, DiffOptions, PrInfo,
 };
-use spinoff::{spinners, Color, Spinner};
+use spinoff::{spinners, Color, Spinner, Streams};
 
 use crate::commit_reference::CommitReference;
 use crate::vcs::{StackedCommitInfo, VcsBackend};
@@ -323,6 +323,9 @@ fn run_app_internal(
         })
     };
     state.set_diff_reference(diff_ref_str);
+    state.annotation_context = pr_info
+        .as_ref()
+        .map(|pr| pr.annotation_context(options.worktree));
 
     // Initialize stacked mode if commits were provided
     if let Some(commits) = stacked_commits {
@@ -331,10 +334,11 @@ fn run_app_internal(
 
     // Load viewed files from GitHub on startup in PR mode (before TUI starts)
     if let Some(ref pr) = pr_info {
-        let mut spinner = Spinner::new(
+        let mut spinner = Spinner::new_with_stream(
             spinners::Dots,
             format!("Syncing viewed status for {} files", state.file_diffs.len()),
             Color::Cyan,
+            Streams::Stderr,
         );
         sync_viewed_files_from_github(pr, &mut state);
         let viewed_count = state.viewed_files.len();
@@ -1870,11 +1874,14 @@ fn run_app_internal(
                             if !state.annotations.is_empty() {
                                 let n = state.annotations.len();
                                 let noun = if n == 1 { "annotation" } else { "annotations" };
-                                let msg = format!(
+                                let mut msg = format!(
                                     "Exit lumen and write {} {} to stdout?\n\n\
                                      Use this to pipe feedback back to a coding agent.",
                                     n, noun,
                                 );
+                                if options.worktree {
+                                    msg.push_str("\n\nIncludes instructions for the agent to reuse or prepare the PR worktree.");
+                                }
                                 active_modal = Some(Modal::confirm("Send annotations", msg));
                             }
                         }

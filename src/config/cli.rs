@@ -120,6 +120,10 @@ pub enum Commands {
         #[arg(long = "detect-pr", conflicts_with = "pr")]
         detect_pr: bool,
 
+        /// Include instructions for the agent to reuse or prepare a PR worktree
+        #[arg(long)]
+        worktree: bool,
+
         /// Filter to specific files
         #[arg(short, long)]
         file: Option<Vec<String>>,
@@ -172,6 +176,21 @@ mod tests {
     fn test_vcs_not_specified() {
         let cli = Cli::try_parse_from(["lumen", "diff"]).unwrap();
         assert_eq!(cli.vcs, None);
+    }
+
+    #[test]
+    fn test_diff_worktree_flag_parses_with_pr_url() {
+        let cli = Cli::try_parse_from([
+            "lumen",
+            "diff",
+            "--worktree",
+            "https://github.com/upstream/project/pull/42",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Diff { worktree, .. } => assert!(worktree),
+            _ => panic!("expected diff command"),
+        }
     }
 
     #[test]

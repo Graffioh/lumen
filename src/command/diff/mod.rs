@@ -20,7 +20,7 @@ use std::io;
 use std::process::{self, Command};
 use std::thread;
 
-use spinoff::{spinners, Color, Spinner};
+use spinoff::{spinners, Color, Spinner, Streams};
 
 use crate::commit_reference::CommitReference;
 use crate::vcs::VcsBackend;
@@ -29,6 +29,7 @@ pub struct DiffOptions {
     pub reference: Option<CommitReference>,
     pub pr: Option<String>,
     pub detect_pr: bool,
+    pub worktree: bool,
     pub file: Option<Vec<String>>,
     pub watch: bool,
     pub theme: Option<String>,
@@ -51,6 +52,49 @@ pub struct PrInfo {
     pub base_repo_owner: String,
     pub head_repo_owner: Option<String>, // None if head repo was deleted (fork deleted)
     pub head_repo: Option<String>,
+}
+
+impl PrInfo {
+    fn annotation_context(&self, worktree: bool) -> String {
+        let source = self
+            .head_repo
+            .as_ref()
+            .map(|repo| format!("https://github.com/{}.git", repo))
+            .unwrap_or_else(|| "unavailable (the source repository was deleted)".to_string());
+        let mut context = format!(
+            "PR: https://github.com/{}/{}/pull/{}\n\n\
+             Base repository: https://github.com/{}/{}.git\n\n\
+             Source repository: {}\n\n\
+             Source branch: `{}`\n\n\
+             Reviewed head commit: `{}`",
+            self.repo_owner, self.repo_name, self.number,
+            self.base_repo_owner, self.repo_name, source, self.head_ref, self.head_commit,
+        );
+        if worktree {
+            context.push_str(
+                "\n\n## Worktree instructions for the coding agent\n\n\
+                 Apply the annotations below in a worktree associated with this PR.\n\n\
+                 1. Locate the local repository by matching its remotes to the source or base \
+                 repository above. Do not assume the current checkout is the PR's source.\n\
+                 2. Inspect registered worktrees before creating anything. Reuse an existing \
+                 worktree associated with this PR or its source repository and branch. Do not \
+                 create a new worktree for each annotation round.\n\
+                 3. Fetch and verify the current source branch head. If the matching worktree \
+                 is already up to date, use it. If it is clean and behind, fast-forward it. \
+                 Preserve uncommitted edits and local commits; do not reset, discard, or \
+                 overwrite them. If it has diverged, report the conflict instead of silently \
+                 creating another worktree.\n\
+                 4. Only when no matching worktree exists, create one for the source branch \
+                 and retain its association with this PR for later annotation rounds. If the \
+                 source repository or branch is unavailable, report that before editing.\n\
+                 5. Run edits and validation from the selected worktree. These annotations \
+                 refer to the reviewed head commit above: if the source branch has advanced, \
+                 inspect that commit to map the comments to the current code before applying them.\n\n\
+                 Lumen only supplies this handoff; it has not created, updated, or switched a worktree.",
+            );
+        }
+        context
+    }
 }
 
 fn parse_pr_input(input: &str) -> Option<(Option<String>, Option<String>, u64)> {
@@ -350,10 +394,11 @@ fn detect_current_branch_pr() -> Result<String, String> {
 pub fn run_diff_ui(mut options: DiffOptions, backend: &dyn VcsBackend) -> io::Result<()> {
     // Resolve --detect-pr into options.pr
     if options.detect_pr && options.pr.is_none() {
-        let mut spinner = Spinner::new(
+        let mut spinner = Spinner::new_with_stream(
             spinners::Dots,
             "Detecting PR for current branch",
             Color::Cyan,
+            Streams::Stderr,
         );
         match detect_current_branch_pr() {
             Ok(number) => {
@@ -378,7 +423,12 @@ pub fn run_diff_ui(mut options: DiffOptions, backend: &dyn VcsBackend) -> io::Re
             }
             None => "Fetching PR".to_string(),
         };
-        let mut spinner = Spinner::new(spinners::Dots, spinner_msg, Color::Cyan);
+        let mut spinner = Spinner::new_with_stream(
+            spinners::Dots,
+            spinner_msg,
+            Color::Cyan,
+            Streams::Stderr,
+        );
         match fetch_pr_info(pr_input, options.origin.as_deref()) {
             Ok(pr_info) => {
                 spinner.success("Fetched PR metadata");
@@ -403,7 +453,12 @@ pub fn run_diff_ui(mut options: DiffOptions, backend: &dyn VcsBackend) -> io::Re
                 }
                 None => "Fetching PR".to_string(),
             };
-            let mut spinner = Spinner::new(spinners::Dots, spinner_msg, Color::Cyan);
+            let mut spinner = Spinner::new_with_stream(
+            spinners::Dots,
+            spinner_msg,
+            Color::Cyan,
+            Streams::Stderr,
+        );
             match fetch_pr_info(input, options.origin.as_deref()) {
                 Ok(pr_info) => {
                     spinner.success("Fetched PR metadata");
@@ -415,6 +470,13 @@ pub fn run_diff_ui(mut options: DiffOptions, backend: &dyn VcsBackend) -> io::Re
                 }
             }
         }
+    }
+
+    if options.worktree {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            "--worktree requires a pull request (URL, number, --pr, or --detect-pr)",
+        ));
     }
 
     // Handle stacked mode for range references
@@ -479,6 +541,29 @@ mod tests {
             }}}
         })
         .to_string()
+    }
+
+    #[test]
+    fn worktree_handoff_identifies_fork_and_requests_reuse() {
+        let response = pr_response(serde_json::json!({
+            "nameWithOwner": "contributor/project-fork",
+            "owner": {"login": "contributor"}
+        }));
+        let info =
+            parse_pr_info_response(&response, 42, "upstream".into(), "project".into()).unwrap();
+        let ordinary = info.annotation_context(false);
+        assert!(ordinary.contains("https://github.com/upstream/project/pull/42"));
+        assert!(ordinary.contains("https://github.com/contributor/project-fork.git"));
+        assert!(ordinary.contains("Source branch: `feature`"));
+        assert!(ordinary.contains("Reviewed head commit: `head-sha`"));
+        assert!(!ordinary.contains("Worktree instructions"));
+        let worktree = info.annotation_context(true);
+        assert!(worktree.contains("Reuse an existing worktree"));
+        assert!(worktree.contains("fast-forward"));
+        assert!(worktree.contains("Preserve uncommitted edits and local commits"));
+        assert!(worktree.contains("Only when no matching worktree exists"));
+        assert!(worktree.contains("if the source branch has advanced"));
+        assert!(worktree.contains("it has not created, updated, or switched a worktree"));
     }
 
     #[test]

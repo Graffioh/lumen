@@ -6,7 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::thread;
 
 use base64::Engine;
-use spinoff::{spinners, Color, Spinner};
+use spinoff::{spinners, Color, Spinner, Streams};
 
 use super::types::{is_binary_content, FileDiff, FileStatus};
 use super::{DiffOptions, PrInfo};
@@ -172,13 +172,14 @@ pub fn load_file_diffs(options: &DiffOptions, backend: &dyn VcsBackend) -> Vec<F
 pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
     let repo_arg = format!("{}/{}", pr_info.repo_owner, pr_info.repo_name);
 
-    let mut spinner = Spinner::new(
+    let mut spinner = Spinner::new_with_stream(
         spinners::Dots,
         format!(
             "Fetching file list for {}/{}#{}",
             pr_info.repo_owner, pr_info.repo_name, pr_info.number
         ),
         Color::Cyan,
+        Streams::Stderr,
     );
 
     // GitHub provides explicit file status and rename paths, including empty files.
@@ -670,6 +671,7 @@ mod tests {
             reference: None,
             pr: None,
             detect_pr: false,
+            worktree: false,
             file: None,
             watch: false,
             theme: None,
@@ -742,6 +744,7 @@ mod tests {
             }),
             pr: None,
             detect_pr: false,
+            worktree: false,
             file: None,
             watch: false,
             theme: None,
