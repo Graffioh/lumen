@@ -5,6 +5,7 @@ use std::sync::mpsc;
 use std::sync::{Arc, Mutex};
 use std::thread;
 
+use base64::Engine;
 use spinoff::{spinners, Color, Spinner};
 
 use super::types::{is_binary_content, FileDiff, FileStatus};
@@ -180,21 +181,20 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
         Color::Cyan,
     );
 
-    // Get PR diff to find changed files
+    // GitHub provides explicit file status and rename paths, including empty files.
     let output = Command::new("gh")
         .args([
-            "pr",
-            "diff",
-            &pr_info.number.to_string(),
-            "--repo",
-            &repo_arg,
+            "api",
+            &format!("repos/{}/pulls/{}/files?per_page=100", repo_arg, pr_info.number),
+            "--paginate",
+            "--slurp",
         ])
         .output();
 
     let output = match output {
         Ok(o) => o,
         Err(e) => {
-            let msg = format!("Failed to run gh pr diff: {}", e);
+            let msg = format!("Failed to fetch PR file list: {}", e);
             spinner.fail(&msg);
             return Err(msg);
         }
@@ -202,13 +202,16 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        let msg = format!("gh pr diff failed: {}", stderr.trim());
+        let msg = format!("Failed to fetch PR file list: {}", stderr.trim());
         spinner.fail(&msg);
         return Err(msg);
     }
 
-    let diff_output = String::from_utf8_lossy(&output.stdout);
-    let changed_files = parse_changed_files_from_diff(&diff_output);
+    let file_list = String::from_utf8_lossy(&output.stdout);
+    let changed_files = parse_pr_changed_files(&file_list).map_err(|e| {
+        spinner.fail(&e);
+        e
+    })?;
     let n = changed_files.len();
 
     if n == 0 {
@@ -217,40 +220,50 @@ pub fn load_pr_file_diffs(pr_info: &PrInfo) -> Result<Vec<FileDiff>, String> {
     }
 
     let base_repo = format!("{}/{}", pr_info.base_repo_owner, pr_info.repo_name);
-    let head_repo = pr_info
-        .head_repo_owner
-        .as_ref()
-        .map(|owner| format!("{}/{}", owner, pr_info.repo_name))
-        .unwrap_or_else(|| base_repo.clone());
+    let head_repo = pr_info.head_repo.as_deref().unwrap_or(&base_repo);
+    // PRs compare the common ancestor to the head, not the current base branch tip.
+    let compare_path = format!(
+        "repos/{}/compare/{}...{}",
+        base_repo, pr_info.base_commit, pr_info.head_commit
+    );
+    let merge_base = github_api(&compare_path, "application/vnd.github+json")
+        .and_then(|response| {
+            let comparison: serde_json::Value = serde_json::from_str(&response)
+                .map_err(|e| format!("Could not parse GitHub comparison: {}", e))?;
+            comparison["merge_base_commit"]["sha"]
+                .as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "GitHub comparison did not return a merge base".to_string())
+        })
+        .map_err(|e| {
+            spinner.fail(&e);
+            e
+        })?;
 
     let contents = fetch_pr_file_contents_parallel(
         &changed_files,
         &base_repo,
-        &pr_info.base_ref,
-        &head_repo,
-        &pr_info.head_ref,
+        &merge_base,
+        head_repo,
+        &pr_info.head_commit,
         &mut spinner,
-    );
+    )
+    .map_err(|e| {
+        spinner.fail(&e);
+        e
+    })?;
 
     let file_diffs: Vec<FileDiff> = changed_files
         .into_iter()
         .zip(contents.into_iter())
-        .map(|(filename, (old_content, new_content))| {
-            let status = if old_content.is_empty() && !new_content.is_empty() {
-                FileStatus::Added
-            } else if !old_content.is_empty() && new_content.is_empty() {
-                FileStatus::Deleted
-            } else {
-                FileStatus::Modified
-            };
-
+        .map(|(file, (old_content, new_content))| {
             let is_binary =
                 is_binary_content(&old_content) || is_binary_content(&new_content);
             FileDiff {
-                filename,
+                filename: file.filename,
                 old_content,
                 new_content,
-                status,
+                status: file.status,
                 is_binary,
             }
         })
@@ -280,37 +293,39 @@ enum FetchEvent {
         idx: usize,
         side: Side,
         filename: String,
-        content: String,
+        content: Result<String, String>,
     },
 }
 
 /// Fetch (old, new) contents for every changed file using a bounded worker
 /// pool, updating `spinner` with live progress.
 fn fetch_pr_file_contents_parallel(
-    files: &[String],
+    files: &[PrChangedFile],
     base_repo: &str,
     base_ref: &str,
     head_repo: &str,
     head_ref: &str,
     spinner: &mut Spinner,
-) -> Vec<(String, String)> {
+) -> Result<Vec<(String, String)>, String> {
     let n = files.len();
     let mut tasks: Vec<FetchTask> = Vec::with_capacity(2 * n);
-    for (idx, filename) in files.iter().enumerate() {
-        tasks.push(FetchTask {
-            idx,
-            filename: filename.clone(),
-            repo: base_repo.to_string(),
-            git_ref: base_ref.to_string(),
-            side: Side::Old,
-        });
-        tasks.push(FetchTask {
-            idx,
-            filename: filename.clone(),
-            repo: head_repo.to_string(),
-            git_ref: head_ref.to_string(),
-            side: Side::New,
-        });
+    for (idx, file) in files.iter().enumerate() {
+        for (path, repo, git_ref, side) in [
+            (&file.old_path, base_repo, base_ref, Side::Old),
+            (&file.new_path, head_repo, head_ref, Side::New),
+        ] {
+            // Added/deleted files have only one side. Never mistake a failed
+            // download for an absent side of the diff.
+            if let Some(path) = path {
+                tasks.push(FetchTask {
+                    idx,
+                    filename: path.clone(),
+                    repo: repo.to_string(),
+                    git_ref: git_ref.to_string(),
+                    side,
+                });
+            }
+        }
     }
     // Pop from the back, so process files in listed order.
     tasks.reverse();
@@ -341,6 +356,7 @@ fn fetch_pr_file_contents_parallel(
 
     let mut contents: Vec<(String, String)> = vec![(String::new(), String::new()); n];
     let mut done = 0usize;
+    let mut first_error = None;
     let mut in_flight: Vec<String> = Vec::new();
     let mut last_finished: Option<String> = None;
 
@@ -358,9 +374,14 @@ fn fetch_pr_file_contents_parallel(
                 if let Some(pos) = in_flight.iter().position(|f| f == &filename) {
                     in_flight.swap_remove(pos);
                 }
-                match side {
-                    Side::Old => contents[idx].0 = content,
-                    Side::New => contents[idx].1 = content,
+                match content {
+                    Ok(content) => match side {
+                        Side::Old => contents[idx].0 = content,
+                        Side::New => contents[idx].1 = content,
+                    },
+                    Err(e) => {
+                        first_error.get_or_insert(e);
+                    }
                 }
                 done += 1;
                 last_finished = Some(filename);
@@ -370,10 +391,15 @@ fn fetch_pr_file_contents_parallel(
     }
 
     for h in handles {
-        let _ = h.join();
+        if h.join().is_err() {
+            first_error.get_or_insert_with(|| "PR file download worker failed".to_string());
+        }
     }
 
-    contents
+    match first_error {
+        Some(e) => Err(e),
+        None => Ok(contents),
+    }
 }
 
 fn format_fetch_progress(
@@ -396,41 +422,109 @@ fn format_fetch_progress(
     }
 }
 
-fn fetch_file_content_from_github(repo: &str, git_ref: &str, path: &str) -> String {
+fn fetch_file_content_from_github(repo: &str, git_ref: &str, path: &str) -> Result<String, String> {
     let api_path = format!("repos/{}/contents/{}?ref={}", repo, path, git_ref);
-    let output = Command::new("gh")
-        .args([
-            "api",
-            &api_path,
-            "-H",
-            "Accept: application/vnd.github.raw+json",
-        ])
-        .output();
-
-    match output {
-        Ok(o) if o.status.success() => String::from_utf8_lossy(&o.stdout).to_string(),
-        _ => String::new(),
+    // Raw content can be changed by gh's output sanitization. Base64 keeps
+    // literal escape sequences and binary data intact while passing through gh.
+    let response = github_api(&api_path, "application/vnd.github+json")?;
+    let mut file: serde_json::Value = serde_json::from_str(&response)
+        .map_err(|e| format!("Could not parse file metadata for {}: {}", path, e))?;
+    // The Contents API omits content above 1 MB; the blob API still provides it.
+    if file["encoding"].as_str() == Some("none") {
+        let sha = file["sha"]
+            .as_str()
+            .ok_or_else(|| format!("Missing blob SHA for {}", path))?;
+        let response = github_api(
+            &format!("repos/{}/git/blobs/{}", repo, sha),
+            "application/vnd.github+json",
+        )?;
+        file = serde_json::from_str(&response)
+            .map_err(|e| format!("Could not parse blob for {}: {}", path, e))?;
     }
+    decode_github_content(&file).map_err(|e| format!("Failed to load {}: {}", path, e))
 }
 
-fn parse_changed_files_from_diff(diff: &str) -> Vec<String> {
-    let mut files = Vec::new();
-
-    for line in diff.lines() {
-        if line.starts_with("diff --git") {
-            let parts: Vec<&str> = line.split_whitespace().collect();
-            if parts.len() >= 4 {
-                let b_path = parts[3];
-                if let Some(filename) = b_path.strip_prefix("b/") {
-                    files.push(filename.to_string());
-                } else {
-                    files.push(b_path.to_string());
-                }
-            }
-        }
+fn decode_github_content(file: &serde_json::Value) -> Result<String, String> {
+    if file["encoding"].as_str() != Some("base64") {
+        return Err("GitHub did not return base64 file content".to_string());
     }
+    let encoded = file["content"]
+        .as_str()
+        .ok_or_else(|| "GitHub did not return file content".to_string())?;
+    let encoded: String = encoded
+        .chars()
+        .filter(|c| !c.is_ascii_whitespace())
+        .collect();
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(encoded)
+        .map_err(|e| format!("Invalid base64 file content: {}", e))?;
+    Ok(String::from_utf8_lossy(&bytes).into_owned())
+}
 
-    files
+fn github_api(api_path: &str, accept: &str) -> Result<String, String> {
+    let output = Command::new("gh")
+        .args(["api", api_path, "-H", &format!("Accept: {}", accept)])
+        .output()
+        .map_err(|e| format!("Failed to run gh api for {}: {}", api_path, e))?;
+    if !output.status.success() {
+        return Err(format!(
+            "Failed to fetch {}: {}",
+            api_path,
+            String::from_utf8_lossy(&output.stderr).trim()
+        ));
+    }
+    Ok(String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+#[derive(Debug)]
+struct PrChangedFile {
+    filename: String,
+    old_path: Option<String>,
+    new_path: Option<String>,
+    status: FileStatus,
+}
+
+fn parse_pr_changed_files(response: &str) -> Result<Vec<PrChangedFile>, String> {
+    #[derive(serde::Deserialize)]
+    struct GithubFile {
+        filename: String,
+        status: String,
+        previous_filename: Option<String>,
+    }
+    let pages: Vec<Vec<GithubFile>> = serde_json::from_str(response)
+        .map_err(|e| format!("Could not parse PR file list: {}", e))?;
+    pages
+        .into_iter()
+        .flatten()
+        .map(|file| {
+            let status = match file.status.as_str() {
+                "added" | "copied" => FileStatus::Added,
+                "removed" => FileStatus::Deleted,
+                "modified" | "renamed" | "changed" => FileStatus::Modified,
+                other => return Err(format!("Unsupported PR file status: {}", other)),
+            };
+            let old_path = if status == FileStatus::Added {
+                None
+            } else if file.status == "renamed" {
+                Some(file.previous_filename.ok_or_else(|| {
+                    format!("Renamed PR file has no previous path: {}", file.filename)
+                })?)
+            } else {
+                Some(file.filename.clone())
+            };
+            let new_path = if status == FileStatus::Deleted {
+                None
+            } else {
+                Some(file.filename.clone())
+            };
+            Ok(PrChangedFile {
+                filename: file.filename,
+                old_path,
+                new_path,
+                status,
+            })
+        })
+        .collect()
 }
 
 /// Load file diffs for a single commit (comparing commit to its parent).
@@ -500,6 +594,52 @@ mod tests {
     use crate::vcs::test_utils::{git, make_temp_dir, RepoGuard};
     use crate::vcs::GitBackend;
     use std::fs;
+
+    #[test]
+    fn github_content_preserves_literal_control_escapes_and_empty_files() {
+        let original = "literal \\u0000 and \\u0001\n";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(original);
+        let file = serde_json::json!({"encoding": "base64", "content": format!("{}\n", encoded)});
+        assert_eq!(decode_github_content(&file).unwrap(), original);
+        let empty = serde_json::json!({"encoding": "base64", "content": ""});
+        assert_eq!(decode_github_content(&empty).unwrap(), "");
+        let invalid = serde_json::json!({"encoding": "base64", "content": "!!!"});
+        assert!(decode_github_content(&invalid).is_err());
+        assert!(decode_github_content(&serde_json::json!({})).is_err());
+    }
+
+    #[test]
+    fn pr_diff_distinguishes_missing_sides_from_empty_files() {
+        let response = r#"[
+            [{"filename":"empty.txt","status":"added"},
+             {"filename":"deleted.txt","status":"removed"}],
+            [{"filename":"modified.txt","status":"modified"}]
+        ]"#;
+        let files = parse_pr_changed_files(response).unwrap();
+        assert_eq!(files.len(), 3);
+        assert_eq!(files[0].status, FileStatus::Added);
+        assert_eq!(files[0].old_path, None);
+        assert_eq!(files[0].new_path.as_deref(), Some("empty.txt"));
+        assert_eq!(files[1].status, FileStatus::Deleted);
+        assert_eq!(files[1].old_path.as_deref(), Some("deleted.txt"));
+        assert_eq!(files[1].new_path, None);
+        assert_eq!(files[2].status, FileStatus::Modified);
+        assert_eq!(files[2].old_path.as_deref(), Some("modified.txt"));
+        assert_eq!(files[2].new_path.as_deref(), Some("modified.txt"));
+    }
+
+    #[test]
+    fn pr_diff_fetches_renamed_files_from_their_original_path() {
+        let response = r#"[[{
+            "filename":"new.txt","status":"renamed","previous_filename":"old.txt"
+        }]]"#;
+        let files = parse_pr_changed_files(response).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].filename, "new.txt");
+        assert_eq!(files[0].old_path.as_deref(), Some("old.txt"));
+        assert_eq!(files[0].new_path.as_deref(), Some("new.txt"));
+        assert_eq!(files[0].status, FileStatus::Modified);
+    }
 
     #[test]
     fn test_load_file_diffs_working_tree_untracked_in_new_dir() {

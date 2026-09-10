@@ -46,8 +46,11 @@ pub struct PrInfo {
     pub repo_name: String,
     pub base_ref: String,
     pub head_ref: String,
+    pub base_commit: String,
+    pub head_commit: String,
     pub base_repo_owner: String,
     pub head_repo_owner: Option<String>, // None if head repo was deleted (fork deleted)
+    pub head_repo: Option<String>,
 }
 
 fn parse_pr_input(input: &str) -> Option<(Option<String>, Option<String>, u64)> {
@@ -131,7 +134,7 @@ fn fetch_pr_info(pr_input: &str, repo_override: Option<&str>) -> Result<PrInfo, 
 
     // Use GraphQL to get the PR node ID, branch refs, and repo owners
     let query = format!(
-        r#"query {{ repository(owner: "{}", name: "{}") {{ pullRequest(number: {}) {{ id url baseRefName headRefName baseRepository {{ owner {{ login }} }} headRepository {{ owner {{ login }} }} }} }} }}"#,
+        r#"query {{ repository(owner: "{}", name: "{}") {{ pullRequest(number: {}) {{ id url baseRefName headRefName baseRefOid headRefOid baseRepository {{ owner {{ login }} }} headRepository {{ nameWithOwner owner {{ login }} }} }} }} }}"#,
         repo_owner, repo_name, number
     );
 
@@ -145,20 +148,56 @@ fn fetch_pr_info(pr_input: &str, repo_override: Option<&str>) -> Result<PrInfo, 
         return Err(format!("gh api graphql failed: {}", stderr.trim()));
     }
 
-    let json_str = String::from_utf8_lossy(&output.stdout);
+    parse_pr_info_response(
+        &String::from_utf8_lossy(&output.stdout),
+        number,
+        repo_owner,
+        repo_name,
+    )
+}
 
-    // Parse the GraphQL response
-    let node_id = extract_json_string(&json_str, "id")
-        .ok_or_else(|| "Could not parse PR node ID from GraphQL response".to_string())?;
-    let base_ref =
-        extract_json_string(&json_str, "baseRefName").unwrap_or_else(|| "base".to_string());
-    let head_ref =
-        extract_json_string(&json_str, "headRefName").unwrap_or_else(|| "head".to_string());
-
-    // Extract repo owners from nested structure
-    let base_repo_owner =
-        extract_nested_login(&json_str, "baseRepository").unwrap_or_else(|| repo_owner.clone());
-    let head_repo_owner = extract_nested_login(&json_str, "headRepository");
+fn parse_pr_info_response(
+    response: &str,
+    number: u64,
+    repo_owner: String,
+    repo_name: String,
+) -> Result<PrInfo, String> {
+    let json: serde_json::Value = serde_json::from_str(response)
+        .map_err(|e| format!("Could not parse PR GraphQL response: {}", e))?;
+    let pr = &json["data"]["repository"]["pullRequest"];
+    let node_id = pr["id"]
+        .as_str()
+        .ok_or_else(|| "Could not parse PR node ID from GraphQL response".to_string())?
+        .to_string();
+    let base_ref = pr["baseRefName"].as_str().unwrap_or("base").to_string();
+    let head_ref = pr["headRefName"].as_str().unwrap_or("head").to_string();
+    let base_commit = pr["baseRefOid"]
+        .as_str()
+        .ok_or_else(|| "Could not parse PR base commit".to_string())?
+        .to_string();
+    let head_commit = pr["headRefOid"]
+        .as_str()
+        .ok_or_else(|| "Could not parse PR head commit".to_string())?
+        .to_string();
+    let base_repo_owner = pr["baseRepository"]["owner"]["login"]
+        .as_str()
+        .unwrap_or(&repo_owner)
+        .to_string();
+    let head_repo_owner = pr["headRepository"]["owner"]["login"]
+        .as_str()
+        .map(str::to_string);
+    let head_repo = if pr["headRepository"].is_null() {
+        None
+    } else {
+        Some(
+            pr["headRepository"]["nameWithOwner"]
+                .as_str()
+                .ok_or_else(|| {
+                    "Could not parse head repository name from GraphQL response".to_string()
+                })?
+                .to_string(),
+        )
+    };
 
     Ok(PrInfo {
         number,
@@ -167,42 +206,12 @@ fn fetch_pr_info(pr_input: &str, repo_override: Option<&str>) -> Result<PrInfo, 
         repo_name,
         base_ref,
         head_ref,
+        base_commit,
+        head_commit,
         base_repo_owner,
         head_repo_owner,
+        head_repo,
     })
-}
-
-fn extract_json_string(json: &str, key: &str) -> Option<String> {
-    let pattern = format!("\"{}\":\"", key);
-    if let Some(start) = json.find(&pattern) {
-        let value_start = start + pattern.len();
-        if let Some(end) = json[value_start..].find('"') {
-            return Some(json[value_start..value_start + end].to_string());
-        }
-    }
-    None
-}
-
-fn extract_nested_login(json: &str, parent_key: &str) -> Option<String> {
-    // Look for pattern like "baseRepository":{"owner":{"login":"username"}}
-    // or handle null case like "headRepository":null
-    let pattern = format!("\"{}\":", parent_key);
-    if let Some(start) = json.find(&pattern) {
-        let after_key = &json[start + pattern.len()..];
-        // Check if it's null
-        if after_key.trim_start().starts_with("null") {
-            return None;
-        }
-        // Look for login within this section
-        if let Some(login_start) = after_key.find("\"login\":\"") {
-            let value_start = login_start + 9;
-            let after_login = &after_key[value_start..];
-            if let Some(end) = after_login.find('"') {
-                return Some(after_login[..end].to_string());
-            }
-        }
-    }
-    None
 }
 
 /// Fetch the list of files that are marked as viewed on GitHub
@@ -451,4 +460,66 @@ pub fn run_diff_ui(mut options: DiffOptions, backend: &dyn VcsBackend) -> io::Re
     }
 
     app::run_app(options, None, backend)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn pr_response(head_repository: serde_json::Value) -> String {
+        serde_json::json!({
+            "data": {"repository": {"pullRequest": {
+                "id": "PR_test",
+                "baseRefName": "main",
+                "headRefName": "feature",
+                "baseRefOid": "base-sha",
+                "headRefOid": "head-sha",
+                "baseRepository": {"owner": {"login": "upstream"}},
+                "headRepository": head_repository
+            }}}
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn pr_info_preserves_renamed_fork_repository() {
+        let response = pr_response(serde_json::json!({
+            "nameWithOwner": "contributor/project-fork",
+            "owner": {"login": "contributor"}
+        }));
+        let info =
+            parse_pr_info_response(&response, 42, "upstream".into(), "project".into()).unwrap();
+        assert_eq!(info.head_repo.as_deref(), Some("contributor/project-fork"));
+        assert_eq!(info.head_repo_owner.as_deref(), Some("contributor"));
+        assert_eq!(info.repo_name, "project");
+        assert_eq!(info.base_repo_owner, "upstream");
+        assert_eq!(info.base_ref, "main");
+        assert_eq!(info.head_ref, "feature");
+        assert_eq!(info.base_commit, "base-sha");
+        assert_eq!(info.head_commit, "head-sha");
+    }
+
+    #[test]
+    fn pr_info_handles_same_repository_and_deleted_fork() {
+        let response = pr_response(serde_json::json!({
+            "nameWithOwner": "upstream/project",
+            "owner": {"login": "upstream"}
+        }));
+        let info =
+            parse_pr_info_response(&response, 42, "upstream".into(), "project".into()).unwrap();
+        assert_eq!(info.head_repo.as_deref(), Some("upstream/project"));
+
+        let response = pr_response(serde_json::Value::Null);
+        let info =
+            parse_pr_info_response(&response, 42, "upstream".into(), "project".into()).unwrap();
+        assert!(info.head_repo.is_none());
+        assert!(info.head_repo_owner.is_none());
+    }
+
+    #[test]
+    fn pr_info_rejects_missing_head_repository_name() {
+        let response = pr_response(serde_json::json!({"owner": {"login": "contributor"}}));
+        let result = parse_pr_info_response(&response, 42, "upstream".into(), "project".into());
+        assert!(result.err().unwrap().contains("head repository name"));
+    }
 }

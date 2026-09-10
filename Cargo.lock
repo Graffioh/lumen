@@ -2556,6 +2556,7 @@ name = "lumen"
 version = "2.32.0"
 dependencies = [
  "arboard",
+ "base64",
  "chrono",
  "clap",
  "crossterm 0.28.1",
